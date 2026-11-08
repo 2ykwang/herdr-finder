@@ -24,7 +24,9 @@ before querying and keeps terminal defaults when colors aren't available.
 
 ## Install
 
-Requires Herdr 0.9.5+, Rust, and a C toolchain on macOS or Linux.
+Requires Herdr 0.9.5+, `curl`, `tar`, and `sha256sum` or `shasum`.
+Prebuilt binaries support Apple Silicon/Intel macOS 11+ and x64/ARM64 Linux.
+Rust and a C toolchain are only needed for development.
 
 ```sh
 herdr plugin install 2ykwang/herdr-finder
@@ -62,6 +64,8 @@ Press your Herdr prefix, then **Shift+F**. With a Ctrl+A prefix, that's
 | F1 | Help |
 
 ## Develop
+
+Install Rust and a C toolchain, then build the local checkout:
 
 ```sh
 cargo test --locked

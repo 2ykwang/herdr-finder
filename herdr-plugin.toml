@@ -6,7 +6,7 @@ description = "Find running sessions by task name or terminal text, grouped by w
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["sh", "scripts/build.sh"]
+command = ["sh", "scripts/install.sh"]
 
 [[actions]]
 id = "open"
