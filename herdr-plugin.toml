@@ -1,0 +1,23 @@
+id = "herdr-finder"
+name = "Herdr Finder"
+version = "1.0.0"
+min_herdr_version = "0.9.5"
+description = "Find running sessions by task name or terminal text, grouped by workspace and tab"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[actions]]
+id = "open"
+title = "Herdr Finder"
+contexts = ["workspace", "pane"]
+command = ["bin/herdr-finder", "open"]
+
+[[panes]]
+id = "finder"
+title = "Herdr Finder"
+placement = "popup"
+width = "95%"
+height = "90%"
+command = ["bin/herdr-finder"]

@@ -1,0 +1,33 @@
+[package]
+name = "herdr-finder"
+version = "1.0.0"
+edition = "2024"
+license = "MIT AND Apache-2.0"
+description = "Find and switch between Herdr sessions by task name or visible terminal text"
+default-run = "herdr-finder"
+
+[[bin]]
+name = "herdr-finder"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+crossterm = "0.29"
+libc = "0.2"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13.1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
