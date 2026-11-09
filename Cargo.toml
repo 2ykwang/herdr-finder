@@ -1,6 +1,6 @@
 [package]
 name = "herdr-finder"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "MIT AND Apache-2.0"
 description = "Find and switch between Herdr sessions by task name or visible terminal text"
