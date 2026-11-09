@@ -1,10 +1,9 @@
-//! Cached native hierarchy, filtering and terminal-identity selection.
+//! Ranked queries over native hierarchy and terminal-identity selection.
 
 use crate::model::{Session, Snapshot, Workspace};
-use crate::provider;
-use crate::search::{ContentDocument, SearchMatch, find_matches_terms, query_terms};
+use crate::query::{Query, RankedMatch};
+use crate::search::ContentDocument;
 use chrono::{DateTime, Utc};
-use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,11 +34,14 @@ pub struct Row {
     pub total: usize,
     pub collapsed: bool,
     pub query_terms: Vec<String>,
+    pub fuzzy_terms: Vec<String>,
     pub snippets: Vec<String>,
     pub snippet_spans: Vec<Vec<(usize, usize)>>,
     pub activity_at: Option<DateTime<Utc>>,
     pub separator_before: bool,
     pub body_hit: bool,
+    pub match_reason: String,
+    pub score: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -70,12 +72,6 @@ struct CachedContent {
     identity: Identity,
     revision: u64,
     document: ContentDocument,
-}
-
-#[derive(Clone, Debug)]
-struct Metadata {
-    values: Vec<String>,
-    document: OnceCell<ContentDocument>,
 }
 
 #[derive(Default)]
@@ -180,8 +176,12 @@ pub struct FinderState {
     pub collapsed: HashSet<String>,
     pub collapsed_tabs: HashSet<String>,
     pub selection_lost: bool,
+    pub query_error: Option<String>,
     selected_key: Option<String>,
+    // Late screen evidence may improve ranking without replacing a manually chosen target.
+    selection_manual: bool,
     terms: Vec<String>,
+    ranked_query: Query,
     rows: Vec<Row>,
     indices: HashMap<String, usize>,
     selectable_rows: Vec<usize>,
@@ -190,8 +190,6 @@ pub struct FinderState {
     tab_targets: TargetNavigation,
     sessions: HashMap<String, Session>,
     tabs: HashMap<String, Vec<TabNode>>,
-    metadata: HashMap<String, Metadata>,
-    workspace_search: HashMap<String, ContentDocument>,
     contents: HashMap<String, CachedContent>,
 }
 
@@ -201,7 +199,26 @@ impl FinderState {
     }
 
     pub fn is_filtering(&self) -> bool {
-        !self.terms.is_empty()
+        !self.query.trim().is_empty()
+    }
+
+    /// Whether a valid query can match or exclude terminal screen text.
+    pub fn needs_contents(&self) -> bool {
+        self.query_error.is_none() && self.ranked_query.needs_screens()
+    }
+
+    fn prepare_query(&mut self) {
+        self.query_error = None;
+        match Query::parse(&self.query) {
+            Ok(query) => {
+                self.terms = query.positive_terms();
+                self.ranked_query = query;
+            }
+            Err(error) => {
+                self.terms.clear();
+                self.query_error = Some(error);
+            }
+        }
     }
 
     pub fn selected_key(&self) -> Option<&str> {
@@ -281,41 +298,6 @@ impl FinderState {
             }
         }
         self.tabs = tabs;
-        let mut metadata = HashMap::new();
-        self.workspace_search.clear();
-        for workspace in &snapshot.workspaces {
-            self.workspace_search
-                .insert(workspace.id.clone(), ContentDocument::new(&workspace.label));
-            for tab in self.tabs.get(&workspace.id).into_iter().flatten() {
-                for terminal_id in &tab.sessions {
-                    let Some(session) = self.sessions.get(terminal_id) else {
-                        continue;
-                    };
-                    let mut values = vec![
-                        workspace.label.clone(),
-                        tab.label.clone(),
-                        session.title.clone(),
-                        session.tab_label.clone(),
-                        session.name.clone(),
-                        session.kind.clone(),
-                        session.display_kind.clone(),
-                        session.cwd.clone(),
-                    ];
-                    // Friendly badge names remain searchable without changing native identity.
-                    if let Some(provider) = provider::lookup(&session.kind) {
-                        values.push(provider.label.to_owned());
-                    }
-                    values.extend(session.search_titles.clone());
-                    let previous = self.metadata.remove(terminal_id);
-                    let document = previous
-                        .filter(|previous| previous.values == values)
-                        .map(|previous| previous.document)
-                        .unwrap_or_default();
-                    metadata.insert(terminal_id.clone(), Metadata { values, document });
-                }
-            }
-        }
-        self.metadata = metadata;
         self.contents.retain(|id, content| {
             self.sessions
                 .get(id)
@@ -323,30 +305,24 @@ impl FinderState {
         });
     }
 
-    fn metadata_document(&self, terminal_id: &str) -> Option<&ContentDocument> {
-        self.metadata.get(terminal_id).map(|metadata| {
-            metadata
-                .document
-                .get_or_init(|| ContentDocument::new(metadata.values.join(" ")))
-        })
-    }
-
     fn rebuild(&mut self) {
+        let querying = self.is_filtering();
+        if self.query_error.is_some() {
+            self.index_rows(Vec::new(), querying);
+            return;
+        }
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        // Filtering exposes descendants temporarily without changing the saved fold choices.
-        let querying = !self.terms.is_empty();
-        let empty = ContentDocument::default();
-        let mut rows = Vec::new();
+        let fuzzy_terms = self.ranked_query.fuzzy_terms();
+        let mut workspaces = Vec::new();
         for workspace in &snapshot.workspaces {
-            let mut children = Vec::new();
+            let mut tabs = Vec::new();
             let mut count = 0;
             let mut total = 0;
-            let mut visible_tabs = 0;
             for tab in self.tabs.get(&workspace.id).into_iter().flatten() {
-                let mut matched: Vec<(&Session, Option<SearchMatch>)> = Vec::new();
                 total += tab.sessions.len();
+                let mut matched = Vec::new();
                 for terminal_id in &tab.sessions {
                     let Some(session) = self.sessions.get(terminal_id) else {
                         continue;
@@ -359,88 +335,95 @@ impl FinderState {
                         continue;
                     }
                     let found = if querying {
-                        let Some(metadata) = self.metadata_document(terminal_id) else {
+                        let Some(found) = self.ranked_query.match_session(
+                            session,
+                            workspace,
+                            &tab.label,
+                            self.content(session),
+                        ) else {
                             continue;
                         };
-                        let body = self
-                            .contents
-                            .get(terminal_id)
-                            .map_or(&empty, |value| &value.document);
-                        let Some(found) = find_matches_terms(&self.terms, metadata, body) else {
-                            continue;
-                        };
-                        Some(found)
+                        found
                     } else {
-                        None
+                        RankedMatch::default()
                     };
-                    matched.push((session, found));
+                    matched.push(Row {
+                        key: format!("s:{}", session.terminal_id),
+                        workspace: workspace.clone(),
+                        session: Some(session.clone()),
+                        kind: RowKind::Session,
+                        tab_id: tab.id.clone(),
+                        tab_label: tab.label.clone(),
+                        tab_number: tab.number,
+                        total: tab.sessions.len(),
+                        query_terms: self.terms.clone(),
+                        fuzzy_terms: fuzzy_terms.clone(),
+                        snippets: found.screen.excerpt,
+                        snippet_spans: found.screen.highlights,
+                        body_hit: found.screen.body_hit,
+                        activity_at: session.activity_at,
+                        match_reason: found.reason,
+                        score: found.score,
+                        ..Row::default()
+                    });
                 }
-                let empty_match = tab.sessions.is_empty()
-                    && self.status.is_none()
-                    && (!querying
-                        || find_matches_terms(
-                            &self.terms,
-                            &ContentDocument::new(format!("{} {}", workspace.label, tab.label)),
-                            &empty,
-                        )
-                        .is_some());
-                if matched.is_empty() && !empty_match {
+                let empty_score = if !tab.sessions.is_empty() || self.status.is_some() {
+                    None
+                } else if querying {
+                    self.ranked_query.match_group(workspace, Some(&tab.label))
+                } else {
+                    Some(0)
+                };
+                if matched.is_empty() && empty_score.is_none() {
                     continue;
                 }
-                count += matched.len();
-                let collapsed = self.collapsed_tabs.contains(&tab.id) && !querying;
-                children.push(Row {
+                if querying {
+                    matched.sort_by_key(|row| std::cmp::Reverse(row.score));
+                }
+                let score = matched.first().map_or(0, |row| row.score);
+                let matched_count = matched.len();
+                count += matched_count;
+                for row in &mut matched {
+                    row.count = matched_count;
+                }
+                // Search expands matching groups without changing the saved browse folds.
+                let collapsed = !querying && self.collapsed_tabs.contains(&tab.id);
+                let mut rows = vec![Row {
                     key: format!("t:{}", tab.id),
                     workspace: workspace.clone(),
                     kind: RowKind::Tab,
                     tab_id: tab.id.clone(),
                     tab_label: tab.label.clone(),
                     tab_number: tab.number,
-                    count: matched.len(),
+                    count: matched_count,
                     total: tab.sessions.len(),
                     collapsed,
                     query_terms: self.terms.clone(),
-                    separator_before: visible_tabs > 0,
+                    fuzzy_terms: fuzzy_terms.clone(),
+                    score,
                     ..Row::default()
-                });
-                visible_tabs += 1;
+                }];
                 if !collapsed {
-                    let matched_count = matched.len();
-                    for (session, found) in matched {
-                        let found = found.unwrap_or_default();
-                        children.push(Row {
-                            key: format!("s:{}", session.terminal_id),
-                            workspace: workspace.clone(),
-                            session: Some(session.clone()),
-                            kind: RowKind::Session,
-                            tab_id: tab.id.clone(),
-                            tab_label: tab.label.clone(),
-                            tab_number: tab.number,
-                            count: matched_count,
-                            total: tab.sessions.len(),
-                            query_terms: self.terms.clone(),
-                            snippets: found.excerpt,
-                            snippet_spans: found.highlights,
-                            body_hit: found.body_hit,
-                            activity_at: session.activity_at,
-                            ..Row::default()
-                        });
-                    }
+                    rows.extend(matched);
                 }
+                tabs.push(rows);
             }
-            let workspace_match = self.status.is_none()
-                && (!querying
-                    || self
-                        .workspace_search
-                        .get(&workspace.id)
-                        .is_some_and(|metadata| {
-                            find_matches_terms(&self.terms, metadata, &empty).is_some()
-                        }));
-            if children.is_empty() && !workspace_match {
+            let empty_score = if self.status.is_some() {
+                None
+            } else if querying {
+                self.ranked_query.match_group(workspace, None)
+            } else {
+                Some(0)
+            };
+            if tabs.is_empty() && empty_score.is_none() {
                 continue;
             }
-            let collapsed = self.collapsed.contains(&workspace.id) && !querying;
-            rows.push(Row {
+            if querying {
+                tabs.sort_by_key(|rows| std::cmp::Reverse(rows[0].score));
+            }
+            let score = tabs.first().map_or(0, |rows| rows[0].score);
+            let collapsed = !querying && self.collapsed.contains(&workspace.id);
+            let mut rows = vec![Row {
                 key: format!("w:{}", workspace.id),
                 workspace: workspace.clone(),
                 kind: RowKind::Workspace,
@@ -448,13 +431,30 @@ impl FinderState {
                 total,
                 collapsed,
                 query_terms: self.terms.clone(),
-                separator_before: !rows.is_empty(),
+                fuzzy_terms: fuzzy_terms.clone(),
+                score,
                 ..Row::default()
-            });
+            }];
             if !collapsed {
-                rows.extend(children);
+                for (index, mut tab) in tabs.into_iter().enumerate() {
+                    tab[0].separator_before = index > 0;
+                    rows.extend(tab);
+                }
             }
+            workspaces.push(rows);
         }
+        if querying {
+            workspaces.sort_by_key(|rows| std::cmp::Reverse(rows[0].score));
+        }
+        let mut rows = Vec::new();
+        for (index, mut workspace) in workspaces.into_iter().enumerate() {
+            workspace[0].separator_before = index > 0;
+            rows.extend(workspace);
+        }
+        self.index_rows(rows, querying);
+    }
+
+    fn index_rows(&mut self, rows: Vec<Row>, querying: bool) {
         self.indices = rows
             .iter()
             .enumerate()
@@ -492,7 +492,10 @@ impl FinderState {
         if self.selected_key.is_some() && self.selected().is_none() {
             self.selected_key = None;
             self.selection_lost = true;
-        } else if self.selected_key.is_none() && !self.selection_lost && !self.terms.is_empty() {
+        } else if !self.selection_lost
+            && self.is_filtering()
+            && (self.selected_key.is_none() || !self.selection_manual)
+        {
             self.choose_first();
         }
     }
@@ -511,7 +514,9 @@ impl FinderState {
         self.snapshot = Some(snapshot);
         self.rebuild();
         if initial {
-            if let Some(key) = focused.filter(|key| self.indices.contains_key(key)) {
+            let prefer_first = self.is_filtering();
+            if let Some(key) = focused.filter(|key| !prefer_first && self.indices.contains_key(key))
+            {
                 self.selected_key = Some(key);
             } else {
                 self.choose_first();
@@ -534,9 +539,19 @@ impl FinderState {
             )
         });
         let was_lost = self.selection_lost;
-        self.terms = query_terms(&query);
         self.query = query;
+        self.selection_manual = false;
+        self.prepare_query();
         self.rebuild();
+
+        if was_lost {
+            self.selected_key = None;
+            return;
+        }
+        if self.is_filtering() {
+            self.choose_first();
+            return;
+        }
 
         if self
             .selected_key()
@@ -544,12 +559,7 @@ impl FinderState {
         {
             return;
         }
-        if was_lost {
-            self.selected_key = None;
-            return;
-        }
-        if !self.is_filtering()
-            && let Some((tab, workspace)) = parent
+        if let Some((tab, workspace)) = parent
             && (self.select(&tab) || self.select(&workspace))
         {
             return;
@@ -573,6 +583,7 @@ impl FinderState {
             return false;
         }
         self.selected_key = Some(key.to_owned());
+        self.selection_manual = true;
         self.selection_lost = false;
         true
     }
@@ -622,7 +633,7 @@ impl FinderState {
     }
 
     pub fn toggle_group(&mut self, level: Option<GroupLevel>) -> bool {
-        if !self.terms.is_empty() {
+        if self.is_filtering() {
             return false;
         }
         let Some(row) = self.selected() else {
@@ -672,7 +683,7 @@ impl FinderState {
         let Some(row) = self.selected() else {
             return false;
         };
-        if self.terms.is_empty() && row.kind != RowKind::Session && !row.collapsed {
+        if !self.is_filtering() && row.kind != RowKind::Session && !row.collapsed {
             let level = if row.kind == RowKind::Workspace {
                 GroupLevel::Workspace
             } else {
@@ -692,7 +703,7 @@ impl FinderState {
         if row.kind == RowKind::Session {
             return false;
         }
-        if self.terms.is_empty() && row.collapsed {
+        if !self.is_filtering() && row.collapsed {
             let level = if row.kind == RowKind::Workspace {
                 GroupLevel::Workspace
             } else {
@@ -751,6 +762,8 @@ impl FinderState {
                     continue;
                 }
                 if previous.document.text == document.text {
+                    changed |=
+                        previous.revision < current.revision && origin.revision >= current.revision;
                     previous.revision = origin.revision;
                     continue;
                 }
@@ -765,7 +778,7 @@ impl FinderState {
             );
             changed = true;
         }
-        if changed && !self.terms.is_empty() {
+        if changed && self.needs_contents() {
             self.rebuild();
             self.preserve_selection();
         }
@@ -781,10 +794,20 @@ impl FinderState {
             })
     }
 
+    pub fn content(&self, session: &Session) -> Option<&ContentDocument> {
+        let current = self.sessions.get(&session.terminal_id)?;
+        let content = self.contents.get(&session.terminal_id)?;
+        (current.pane_id == session.pane_id
+            && Identity::from(current) == Identity::from(session)
+            && content.identity == Identity::from(current)
+            && content.revision >= current.revision)
+            .then_some(&content.document)
+    }
+
     pub fn clear_contents(&mut self) {
         if !self.contents.is_empty() {
             self.contents.clear();
-            if !self.terms.is_empty() {
+            if self.is_filtering() {
                 self.rebuild();
                 self.preserve_selection();
             }

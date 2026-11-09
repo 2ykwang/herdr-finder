@@ -207,6 +207,49 @@ pub fn highlight_spans_terms(text: &str, terms: &[String]) -> Vec<(usize, usize)
     PreparedText::new(text).highlights(terms)
 }
 
+pub fn metadata_highlight_spans_terms(
+    text: &str,
+    terms: &[String],
+    fuzzy_terms: &[String],
+) -> Vec<(usize, usize)> {
+    if terms.is_empty() && fuzzy_terms.is_empty() {
+        return Vec::new();
+    }
+    let prepared = PreparedText::new(text);
+    let mut hits = prepared.highlights(terms);
+    for term in fuzzy_terms {
+        if term.is_empty() || prepared.normalized.contains(term.as_str()) {
+            continue;
+        }
+        let mut wanted = term.chars().peekable();
+        let mut matched = Vec::new();
+        for (offset, ch) in prepared.normalized.char_indices() {
+            if wanted.peek() == Some(&ch) {
+                wanted.next();
+                if let Some(range) = prepared.original_range(offset, offset + ch.len_utf8()) {
+                    matched.push(range);
+                }
+                if wanted.peek().is_none() {
+                    hits.extend(matched);
+                    break;
+                }
+            }
+        }
+    }
+    hits.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in hits {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 fn bounded_suffix(text: &str, limit: usize) -> &str {
     let mut start = text.len().saturating_sub(limit);
     while !text.is_char_boundary(start) {
