@@ -17,11 +17,19 @@ pub const MAX_CONTENT_LINES: usize = 300;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenCapture {
+    pub text: String,
+    pub revision: u64,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Client {
     socket_path: PathBuf,
     timeout: Duration,
     cancelled: Arc<AtomicBool>,
+    excluded_pane: Option<String>,
 }
 
 impl Client {
@@ -43,6 +51,7 @@ impl Client {
             socket_path,
             timeout,
             cancelled: Arc::new(AtomicBool::new(false)),
+            excluded_pane: None,
         })
     }
 
@@ -60,6 +69,28 @@ impl Client {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// A standalone finder must not match the query rendered in its own terminal.
+    pub fn excluding_caller(mut self) -> Self {
+        if std::env::var_os("HERDR_SOCKET_PATH")
+            .map(PathBuf::from)
+            .as_ref()
+            == Some(&self.socket_path)
+        {
+            self.excluded_pane = std::env::var("HERDR_PANE_ID")
+                .ok()
+                .filter(|id| !id.is_empty() && clean_text(id, false) == *id);
+        }
+        self
+    }
+
+    /// Cancelling a preview must leave snapshots, search and focus requests usable.
+    pub fn independent_requests(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
+        }
     }
 
     pub fn cancellation(&self) -> Arc<AtomicBool> {
@@ -338,7 +369,27 @@ impl Client {
                 "Herdr returned an invalid snapshot response",
             ));
         }
-        Snapshot::from_native(&result["snapshot"])
+        let mut snapshot = Snapshot::from_native(&result["snapshot"])?;
+        if let Some(excluded) = &self.excluded_pane {
+            // The inherited pane ID can be an alias after its terminal moves workspaces.
+            let terminal_id = self
+                .rpc(
+                    "pane.current",
+                    json!({ "caller_pane_id": excluded }),
+                    deadline,
+                )
+                .ok()
+                .filter(|result| result["type"] == "pane_current")
+                .and_then(|result| result["pane"]["terminal_id"].as_str().map(str::to_owned));
+            snapshot.sessions.retain(|session| {
+                terminal_id
+                    .as_ref()
+                    .map_or(&session.pane_id != excluded, |id| {
+                        &session.terminal_id != id
+                    })
+            });
+        }
+        Ok(snapshot)
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
@@ -377,6 +428,69 @@ impl Client {
 
     pub fn read_contents(&self, selected: &[Session]) -> HashMap<String, String> {
         self.read_batch(selected).unwrap_or_default()
+    }
+
+    pub fn read_screen(&self, selected: &Session) -> Result<ScreenCapture> {
+        let deadline = Instant::now() + self.timeout;
+        let before = self.snapshot_until(deadline)?;
+        let current = before.focus_target(selected)?;
+        if current.pane_id != selected.pane_id
+            || current.workspace_id != selected.workspace_id
+            || current.tab_id != selected.tab_id
+        {
+            return Err(FinderError::new(
+                "terminal_changed",
+                "The selected terminal moved. Select it again.",
+            ));
+        }
+        let result = self.rpc(
+            "pane.read",
+            json!({
+                "pane_id": current.pane_id,
+                "source": "visible",
+                "format": "text",
+                "strip_ansi": true,
+            }),
+            deadline,
+        )?;
+        let read = &result["read"];
+        if result["type"] != "pane_read"
+            || !same_address(read, current)
+            || read["source"] != "visible"
+            || read["format"] != "text"
+        {
+            return Err(FinderError::new(
+                "invalid_response",
+                "Herdr returned a different screen target.",
+            ));
+        }
+        let text = read["text"].as_str().ok_or_else(|| {
+            FinderError::new("invalid_response", "Herdr returned an invalid screen.")
+        })?;
+        let revision = read["revision"].as_u64().ok_or_else(|| {
+            FinderError::new("invalid_response", "Herdr omitted the screen revision.")
+        })?;
+        let truncated = read["truncated"].as_bool().ok_or_else(|| {
+            FinderError::new("invalid_response", "Herdr omitted the screen bounds.")
+        })?;
+        let after = self.snapshot_until(deadline)?;
+        let verified = after.focus_target(current)?;
+        if verified.pane_id != current.pane_id
+            || verified.workspace_id != current.workspace_id
+            || verified.tab_id != current.tab_id
+        {
+            return Err(FinderError::new(
+                "terminal_changed",
+                "The selected terminal moved during the screen read.",
+            ));
+        }
+        let sanitized = clean_text(text, true);
+        let bounded = crate::search::clean_body(&sanitized);
+        Ok(ScreenCapture {
+            truncated: truncated || bounded.len() < sanitized.len(),
+            text: bounded,
+            revision,
+        })
     }
 
     fn read_batch(&self, selected: &[Session]) -> Result<HashMap<String, String>> {
@@ -994,6 +1108,158 @@ mod tests {
             }))
         });
         server.client().open_popup().unwrap();
+    }
+
+    #[test]
+    fn selected_screen_preserves_capture_revision_and_truncation_without_interactive_reads() {
+        let mut data = native(1);
+        data["panes"][0]["revision"] = json!(31);
+        let selected = Snapshot::from_native(&data).unwrap().sessions.remove(0);
+        let server = Server::new(move |request| match request["method"].as_str().unwrap() {
+            "session.snapshot" => snapshot(data.clone()),
+            "pane.read" => {
+                assert_eq!(request["params"]["source"], "visible");
+                let Reply::Json(mut reply) = content(&data["panes"][0]) else {
+                    unreachable!()
+                };
+                reply["result"]["read"]["revision"] = json!(31);
+                reply["result"]["read"]["text"] = json!("한글".repeat(40_000));
+                Reply::Json(reply)
+            }
+            other => panic!("Unexpected mutation or interactive read: {other}"),
+        });
+        let capture = server.client().read_screen(&selected).unwrap();
+        assert_eq!(capture.revision, 31);
+        assert!(capture.truncated);
+        assert!(capture.text.len() <= crate::search::MAX_CONTENT_BYTES);
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_busy_terminal_can_return_a_point_in_time_capture_after_more_output_arrives() {
+        let mut data = native(1);
+        data["panes"][0]["revision"] = json!(1);
+        let selected = Snapshot::from_native(&data).unwrap().sessions.remove(0);
+        let reads = AtomicUsize::new(0);
+        let server = Server::new(move |request| {
+            if request["method"] == "session.snapshot" {
+                let mut now = data.clone();
+                if reads.load(Ordering::Acquire) > 0 {
+                    now["panes"][0]["revision"] = json!(2);
+                }
+                snapshot(now)
+            } else {
+                reads.fetch_add(1, Ordering::Release);
+                let Reply::Json(mut reply) = content(&data["panes"][0]) else {
+                    unreachable!()
+                };
+                reply["result"]["read"]["revision"] = json!(1);
+                Reply::Json(reply)
+            }
+        });
+        let capture = server.client().read_screen(&selected).unwrap();
+        assert_eq!(capture.revision, 1);
+        assert!(capture.text.contains("needle"));
+    }
+
+    #[test]
+    fn selected_screen_keeps_rpc_errors_and_rejects_a_replaced_terminal() {
+        let data = native(1);
+        let selected = Snapshot::from_native(&data).unwrap().sessions.remove(0);
+        let server = Server::new(move |request| {
+            if request["method"] == "session.snapshot" {
+                snapshot(data.clone())
+            } else {
+                Reply::Json(json!({"error":{"code":"pane_not_found","message":"Pane disappeared"}}))
+            }
+        });
+        assert_eq!(
+            server.client().read_screen(&selected).unwrap_err().code,
+            "pane_not_found"
+        );
+
+        let data = native(1);
+        let seen = AtomicUsize::new(0);
+        let server = Server::new(move |request| {
+            if request["method"] == "session.snapshot" {
+                let mut now = data.clone();
+                if seen.fetch_add(1, Ordering::Relaxed) > 0 {
+                    now["panes"][0]["terminal_id"] = json!("replacement");
+                }
+                snapshot(now)
+            } else {
+                content(&data["panes"][0])
+            }
+        });
+        assert_eq!(
+            server.client().read_screen(&selected).unwrap_err().code,
+            "missing_terminal"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_slow_preview_leaves_the_main_connection_usable() {
+        let data = native(1);
+        let selected = Snapshot::from_native(&data).unwrap().sessions.remove(0);
+        let server = Server::new(move |request| {
+            if request["method"] == "session.snapshot" {
+                snapshot(data.clone())
+            } else {
+                Reply::Stall
+            }
+        });
+        let client = server.client();
+        let preview = client.independent_requests();
+        let worker = preview.clone();
+        let handle = thread::spawn(move || worker.read_screen(&selected));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "pane.read")
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        preview.cancel();
+        assert_eq!(handle.join().unwrap().unwrap_err().code, "cancelled");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(client.snapshot().unwrap().sessions.len(), 1);
+        server.wait_closed(1);
+    }
+
+    #[test]
+    fn an_excluded_caller_is_never_returned_as_a_search_candidate() {
+        let data = native(2);
+        let server = Server::new(move |_| snapshot(data.clone()));
+        let mut client = server.client();
+        client.excluded_pane = Some("pane-0".into());
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].pane_id, "pane-1");
+    }
+
+    #[test]
+    fn caller_exclusion_resolves_a_moved_pane_alias_to_its_stable_terminal() {
+        let data = native(2);
+        let server = Server::new(move |request| {
+            if request["method"] == "pane.current" {
+                assert_eq!(request["params"]["caller_pane_id"], "old-pane-id");
+                Reply::Json(json!({"result":{
+                    "type":"pane_current", "pane":data["panes"][0],
+                }}))
+            } else {
+                snapshot(data.clone())
+            }
+        });
+        let mut client = server.client();
+        client.excluded_pane = Some("old-pane-id".into());
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].terminal_id, "term-1");
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use chrono::Local;
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -10,7 +9,7 @@ use super::theme::Theme;
 
 use crate::{
     provider,
-    search::highlight_spans_terms,
+    search::{highlight_spans_terms, metadata_highlight_spans_terms},
     state::{Row, RowKind},
 };
 
@@ -102,6 +101,11 @@ fn styled(text: String, terms: &[String], base: Style, theme: Theme) -> Vec<Span
     styled_spans(text, &spans, base, theme)
 }
 
+fn styled_metadata(text: String, row: &Row, base: Style, theme: Theme) -> Vec<Span<'static>> {
+    let ranges = metadata_highlight_spans_terms(&text, &row.query_terms, &row.fuzzy_terms);
+    styled_spans(text, &ranges, base, theme)
+}
+
 fn styled_spans(
     text: String,
     ranges: &[(usize, usize)],
@@ -169,49 +173,12 @@ fn session_line(row: &Row, cells: usize, theme: Theme) -> Line<'static> {
         spans.push(Span::styled(badge, theme.provider(&session.kind)));
     }
     let available = cells.saturating_sub(prefix);
-    let mut parts = Vec::new();
-    if cells >= 80 && session.split_count > 1 {
-        parts.push(format!("{}/{}", session.split_index, session.split_count));
-    }
-    if cells >= 80 && !session.name.is_empty() && session.name != session.title {
-        parts.push(session.name.clone());
-    }
-    if cells >= 100
-        && let Some(at) = row.activity_at
-    {
-        parts.push(
-            at.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string(),
-        );
-    }
-    let context = parts.join("  ");
-    let (title, context) = if context.is_empty() || available < 12 {
-        (middle(&session.title, available), String::new())
-    } else {
-        let title_budget = width(&session.title).min((available * 2 / 3).max(5));
-        let context_budget = width(&context).min(available.saturating_sub(title_budget + 2).max(5));
-        (
-            middle(&session.title, available.saturating_sub(context_budget + 2)),
-            middle(&context, context_budget),
-        )
-    };
-    spans.extend(styled(
-        title.clone(),
-        &row.query_terms,
+    spans.extend(styled_metadata(
+        middle(&session.title, available),
+        row,
         theme.normal(),
         theme,
     ));
-    if !context.is_empty() {
-        spans.push(Span::raw(
-            " ".repeat(
-                available
-                    .saturating_sub(width(&title) + width(&context))
-                    .max(2),
-            ),
-        ));
-        spans.extend(styled(context, &row.query_terms, theme.muted(), theme));
-    }
     Line::from(spans)
 }
 
@@ -254,6 +221,70 @@ fn snippet(text: &str, ranges: &[(usize, usize)], cells: usize, theme: Theme) ->
     ))
 }
 
+pub fn preview_line(text: &str, terms: &[String], cells: usize, theme: Theme) -> Line<'static> {
+    let ranges = highlight_spans_terms(text, terms);
+    if ranges.iter().any(|&(_, end)| width(&text[..end]) > cells) {
+        return snippet(text, &ranges, cells, theme);
+    }
+    Line::from(styled(clip(text, cells), terms, theme.normal(), theme))
+}
+
+pub fn selection_lines(row: &Row, cells: usize, height: usize, theme: Theme) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let Some(session) = &row.session else {
+        return Vec::new();
+    };
+    let mut lines = vec![Line::from(styled_metadata(
+        middle(&session.title, cells),
+        row,
+        theme.normal().add_modifier(ratatui::style::Modifier::BOLD),
+        theme,
+    ))];
+    let status = match session.status.as_str() {
+        "blocked" => "Needs input",
+        "done" => "Unseen completion",
+        "working" => "Working",
+        "idle" => "Idle",
+        _ => "Status unknown",
+    };
+    let context = format!(
+        "{} | {status} | {} / {}",
+        provider_label(&session.kind, &session.display_kind),
+        row.workspace.label,
+        row.tab_label
+    );
+    if height >= 4 {
+        lines.push(Line::styled(clip(&context, cells), theme.muted()));
+    }
+    if height > lines.len() && !session.cwd.is_empty() {
+        lines.push(Line::from(styled(
+            middle(&session.cwd, cells),
+            &row.query_terms,
+            theme.muted(),
+            theme,
+        )));
+    }
+    let snippet = row
+        .snippets
+        .iter()
+        .find(|line| !highlight_spans_terms(line, &row.query_terms).is_empty())
+        .or_else(|| row.snippets.first());
+    let evidence = match (row.match_reason.is_empty(), snippet) {
+        (false, Some(snippet)) => format!("{} | {snippet}", row.match_reason),
+        (false, None) => row.match_reason.clone(),
+        (true, Some(snippet)) => snippet.clone(),
+        _ if height < 4 => context,
+        _ => String::new(),
+    };
+    if height > lines.len() && !evidence.is_empty() {
+        lines.push(preview_line(&evidence, &row.query_terms, cells, theme));
+    }
+    lines.truncate(height);
+    lines
+}
+
 pub fn tree_lines(rows: &[Row], cells: usize, theme: Theme) -> Vec<VisualLine> {
     let outer_cells = cells;
     let cells = cells.saturating_sub(2);
@@ -291,7 +322,7 @@ pub fn tree_lines(rows: &[Row], cells: usize, theme: Theme) -> Vec<VisualLine> {
             };
             lines.push(VisualLine {
                 key: Some(row.key.clone()),
-                text: Line::from(styled(text, &row.query_terms, base, theme)),
+                text: Line::from(styled_metadata(text, row, base, theme)),
                 is_excerpt: false,
             });
         } else {
@@ -300,42 +331,6 @@ pub fn tree_lines(rows: &[Row], cells: usize, theme: Theme) -> Vec<VisualLine> {
                 text: session_line(row, cells, theme),
                 is_excerpt: false,
             });
-            if cells < 100
-                && let Some(at) = row.activity_at
-            {
-                let text = format!(
-                    "      {}",
-                    at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-                );
-                lines.push(VisualLine {
-                    key: Some(row.key.clone()),
-                    text: Line::styled(clip(&text, cells), theme.muted()),
-                    is_excerpt: false,
-                });
-            }
-            for (index, text) in row.snippets.iter().take(2).enumerate() {
-                let ranges = row.snippet_spans.get(index).cloned().unwrap_or_default();
-                let indent = (cells / 4).min(8);
-                let bar = crop("│ ", cells.saturating_sub(indent));
-                let budget = cells.saturating_sub(indent + width(&bar));
-                let mut line = snippet(text, &ranges, budget, theme);
-                let body_style = theme.excerpt(false);
-                for span in &mut line.spans {
-                    span.style.bg = body_style.bg;
-                }
-                line.spans.push(Span::styled(
-                    " ".repeat(budget.saturating_sub(line.width())),
-                    body_style,
-                ));
-                line.spans.insert(0, Span::styled(bar, body_style));
-                line.spans
-                    .insert(0, Span::styled(" ".repeat(indent), theme.normal()));
-                lines.push(VisualLine {
-                    key: Some(row.key.clone()),
-                    text: line,
-                    is_excerpt: true,
-                });
-            }
         }
     }
     for line in &mut lines {
@@ -350,6 +345,20 @@ pub fn tree_lines(rows: &[Row], cells: usize, theme: Theme) -> Vec<VisualLine> {
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn preview_keeps_literal_evidence_visible_on_a_long_screen_line() {
+        let text = format!("{} connection refused {}", "x".repeat(200), "y".repeat(80));
+        let line = preview_line(&text, &["connection refused".into()], 40, Theme::new(true));
+        assert!(line.to_string().contains("connection refused"));
+        assert!(line.to_string().starts_with('…'));
+        assert!(line.width() <= 40);
+        assert!(line.spans.iter().any(|span| {
+            span.style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        }));
+    }
 
     #[test]
     fn clips_cells_without_splitting_graphemes() {

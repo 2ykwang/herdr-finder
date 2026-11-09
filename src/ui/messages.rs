@@ -15,7 +15,7 @@ impl Messages {
             "group" => "Enter or Space folds this group. Arrows browse groups.",
             "group_search" => "Search keeps matching groups expanded.",
             "conversation" => "Last message",
-            "keys" => "Enter open  Esc browse",
+            "keys" => "Enter browse  Esc browse",
             "list_keys" => "←→ tabs  / search  Enter  Esc",
             "filter" => "Filter",
             "date_unlinked" => "Date unlinked",

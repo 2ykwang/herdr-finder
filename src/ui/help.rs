@@ -13,7 +13,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("← / →", "Jump between tabs"),
             ("Alt+← / →", "Jump between workspaces"),
             ("Enter", "Open a session or fold a group"),
-            ("a b w d i", "All / needs input / working / done / idle"),
+            (
+                "a b w d i",
+                "All / needs input / working / unseen done / idle",
+            ),
             ("Ctrl+R", "Refresh"),
         ],
     ),
@@ -21,8 +24,17 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Search",
         &[
             ("/", "Search names, paths and screen text"),
+            ("Enter", "Keep results and return to browsing"),
             ("← / →", "Move the text cursor"),
             ("Esc", "Back to browsing; Esc again closes Finder"),
+        ],
+    ),
+    (
+        "Preview",
+        &[
+            ("Tab", "Show or hide the selected screen"),
+            ("Alt+↑ / ↓", "Scroll the preview"),
+            ("Ctrl+R", "Refresh sessions and screen"),
         ],
     ),
     (
@@ -30,7 +42,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Click / double-click", "Select / open a session"),
             ("Right-click", "Select the parent group"),
-            ("Wheel", "Scroll without changing selection"),
+            ("Wheel", "Scroll the list or preview under the pointer"),
         ],
     ),
 ];
@@ -101,11 +113,21 @@ pub fn lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
             }
         }
         if *title == "Search" {
-            lines.extend(
-                wrap_words("Every word must match. Current screen only.", width)
-                    .into_iter()
-                    .map(|text| Line::styled(text, theme.muted())),
-            );
+            for note in [
+                "All terms must match. Bare words fuzzy-match titles, names and labels. Paths, agent kinds, statuses and screen text match literal substrings.",
+                "Fields: agent:claude status:blocked ws:Commerce path:api title:payment screen:ECONNREFUSED",
+                "Double quotes match literal phrases: screen:\"connection refused\". !word excludes a literal match. Unclosed quotes show an error.",
+            ] {
+                lines.extend(
+                    wrap_words(note, width)
+                        .into_iter()
+                        .map(|text| Line::styled(text, theme.muted())),
+                );
+            }
+        }
+        if *title == "Preview" {
+            lines.extend(wrap_words("Preview reads the selected visible screen about every 2 seconds. Failed refreshes keep the earlier screen and show the read error. Enlarge the terminal for more screen space.", width)
+                .into_iter().map(|text| Line::styled(text, theme.muted())));
         }
     }
     lines

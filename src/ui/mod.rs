@@ -5,7 +5,6 @@ mod render;
 mod terminal_colors;
 mod theme;
 
-use chrono::Local;
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -22,17 +21,16 @@ use std::{
     collections::HashMap,
     error::Error,
     io::{self, IsTerminal},
-    sync::{Arc, Mutex, mpsc},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    activity::{ActivityReader, ActivityStamp},
-    client::Client,
+    client::{Client, ScreenCapture},
     model::{FinderError, Session, Snapshot},
-    search::ContentDocument,
+    search::{ContentDocument, highlight_spans_terms},
     state::{FinderState, GroupLevel, RowKind},
 };
 use input::Editor;
@@ -44,8 +42,8 @@ use theme::Theme;
 enum Update {
     Snapshot(Result<Snapshot, FinderError>),
     Contents(Vec<Session>, HashMap<String, ContentDocument>),
-    Activity(Vec<Session>, HashMap<String, ActivityStamp>),
     Focus(Result<(), FinderError>),
+    Preview(Box<PreviewResponse>),
 }
 
 #[derive(Default)]
@@ -54,6 +52,39 @@ struct Geometry {
     input: Rect,
     input_start: usize,
     list: Rect,
+    preview: Rect,
+    details: Rect,
+}
+
+struct PreviewCapture {
+    session: Session,
+    document: ContentDocument,
+    truncated: bool,
+    read_at: Instant,
+}
+
+struct PreviewResponse {
+    generation: u64,
+    session: Session,
+    result: Result<ScreenCapture, FinderError>,
+}
+
+struct PreviewRequest {
+    generation: u64,
+    client: Client,
+}
+
+fn same_preview_session(a: &Session, b: &Session) -> bool {
+    a.terminal_id == b.terminal_id
+        && a.pane_id == b.pane_id
+        && a.workspace_id == b.workspace_id
+        && a.tab_id == b.tab_id
+        && a.kind == b.kind
+        && a.native_reference == b.native_reference
+}
+
+fn same_preview_target(a: &Session, b: &Session) -> bool {
+    same_preview_session(a, b) && a.revision == b.revision
 }
 
 struct IndexedScreen {
@@ -62,12 +93,6 @@ struct IndexedScreen {
     reference: Option<(String, String, String)>,
     revision: u64,
     read_at: Instant,
-}
-
-struct CachedActivity {
-    kind: String,
-    reference: Option<(String, String, String)>,
-    stamp: ActivityStamp,
 }
 
 struct App {
@@ -96,13 +121,20 @@ struct App {
 
     snapshot_busy: bool,
     index_busy: bool,
-    activity_busy: bool,
     next_snapshot: Instant,
     index_due: Option<Instant>,
 
     indexed: HashMap<String, IndexedScreen>,
-    stamps: HashMap<String, CachedActivity>,
-    reader: Arc<Mutex<ActivityReader>>,
+
+    preview_visible: bool,
+    preview_target: Option<Session>,
+    preview_due: Option<Instant>,
+    preview_generation: u64,
+    preview_busy: Option<PreviewRequest>,
+    preview_capture: Option<PreviewCapture>,
+    preview_error: Option<FinderError>,
+    preview_scroll: usize,
+    preview_manual_scroll: bool,
 
     sender: mpsc::Sender<Update>,
     receiver: mpsc::Receiver<Update>,
@@ -112,7 +144,6 @@ struct App {
 impl App {
     fn new(client: Client, prefetch: bool) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let reader = ActivityReader::from_env().with_cancel(client.cancellation());
         let mut app = Self {
             client,
             state: FinderState::default(),
@@ -139,13 +170,20 @@ impl App {
 
             snapshot_busy: false,
             index_busy: false,
-            activity_busy: false,
             next_snapshot: Instant::now() + Duration::from_secs(2),
             index_due: None,
 
             indexed: HashMap::new(),
-            stamps: HashMap::new(),
-            reader: Arc::new(Mutex::new(reader)),
+
+            preview_visible: true,
+            preview_target: None,
+            preview_due: None,
+            preview_generation: 0,
+            preview_busy: None,
+            preview_capture: None,
+            preview_error: None,
+            preview_scroll: 0,
+            preview_manual_scroll: false,
 
             sender,
             receiver,
@@ -161,25 +199,12 @@ impl App {
         if self.snapshot_busy || self.opening {
             return;
         }
-        self.snapshot_busy = true;
         let client = self.client.clone();
+        self.snapshot_busy = true;
         let sender = self.sender.clone();
         thread::spawn(move || {
             let _ = sender.send(Update::Snapshot(client.snapshot()));
         });
-    }
-
-    fn enrich(&self, mut snapshot: Snapshot) -> Snapshot {
-        for session in &mut snapshot.sessions {
-            if let Some(cached) = self.stamps.get(&session.terminal_id)
-                && cached.kind == session.kind
-                && cached.reference == session.native_reference
-            {
-                session.activity_at = Some(cached.stamp.at);
-                session.activity_source = cached.stamp.source.clone();
-            }
-        }
-        snapshot
     }
 
     fn tick(&mut self) {
@@ -197,6 +222,8 @@ impl App {
             self.index_due = None;
             self.request_contents();
         }
+        self.sync_preview();
+        self.request_preview();
     }
 
     fn receive(&mut self, update: Update) {
@@ -208,15 +235,11 @@ impl App {
                         let initial = self.state.snapshot.is_none();
                         self.indexed
                             .retain(|id, _| snapshot.sessions.iter().any(|s| &s.terminal_id == id));
-                        self.stamps
-                            .retain(|id, _| snapshot.sessions.iter().any(|s| &s.terminal_id == id));
-                        let snapshot = self.enrich(snapshot);
                         self.state.update(snapshot);
                         self.error.clear();
                         self.reveal |= initial;
                         self.rebuild = true;
-                        self.request_activity();
-                        if !self.state.query.trim().is_empty() {
+                        if self.state.needs_contents() {
                             self.index_due = Some(Instant::now());
                         }
                     }
@@ -250,34 +273,6 @@ impl App {
                 }
                 self.rebuild |= self.state.set_contents(documents, &origin);
             }
-            Update::Activity(origin, stamps) => {
-                self.activity_busy = false;
-                if let Some(snapshot) = &self.state.snapshot {
-                    for before in &origin {
-                        if let Some(stamp) = stamps.get(&before.terminal_id)
-                            && snapshot.sessions.iter().any(|s| {
-                                s.terminal_id == before.terminal_id
-                                    && s.kind == before.kind
-                                    && s.native_reference == before.native_reference
-                            })
-                        {
-                            self.stamps.insert(
-                                before.terminal_id.clone(),
-                                CachedActivity {
-                                    kind: before.kind.clone(),
-                                    reference: before.native_reference.clone(),
-                                    stamp: stamp.clone(),
-                                },
-                            );
-                        }
-                    }
-                    let enriched = self.enrich(snapshot.clone());
-                    if self.state.snapshot.as_ref() != Some(&enriched) {
-                        self.state.update(enriched);
-                        self.rebuild = true;
-                    }
-                }
-            }
             Update::Focus(result) => {
                 self.opening = false;
                 match result {
@@ -285,44 +280,71 @@ impl App {
                     Err(error) => self.error = error.to_string(),
                 }
             }
+            Update::Preview(result) => {
+                let PreviewResponse {
+                    generation,
+                    session: origin,
+                    result,
+                } = *result;
+                if self
+                    .preview_busy
+                    .as_ref()
+                    .is_some_and(|busy| busy.generation == generation)
+                {
+                    self.preview_busy = None;
+                }
+                if generation == self.preview_generation
+                    && self.preview_visible
+                    && self
+                        .state
+                        .selected()
+                        .and_then(|row| row.session.as_ref())
+                        .is_some_and(|current| same_preview_target(current, &origin))
+                {
+                    self.preview_due = Some(Instant::now() + Duration::from_secs(2));
+                    match result {
+                        Ok(capture) => {
+                            let document = ContentDocument::new(capture.text);
+                            if capture.revision >= origin.revision {
+                                let mut captured_session = origin.clone();
+                                captured_session.revision = capture.revision;
+                                self.rebuild |= self.state.set_contents(
+                                    HashMap::from([(origin.terminal_id.clone(), document.clone())]),
+                                    std::slice::from_ref(&captured_session),
+                                );
+                                self.indexed.insert(
+                                    origin.terminal_id.clone(),
+                                    IndexedScreen {
+                                        pane_id: origin.pane_id.clone(),
+                                        kind: origin.kind.clone(),
+                                        reference: origin.native_reference.clone(),
+                                        revision: capture.revision,
+                                        read_at: Instant::now(),
+                                    },
+                                );
+                            }
+                            self.preview_capture = Some(PreviewCapture {
+                                session: origin,
+                                document,
+                                truncated: capture.truncated,
+                                read_at: Instant::now(),
+                            });
+                            self.preview_error = None;
+                        }
+                        Err(error) => self.preview_error = Some(error),
+                    }
+                }
+            }
         }
+        self.sync_preview();
         self.dirty = true;
     }
 
-    fn request_activity(&mut self) {
-        if self.activity_busy {
-            return;
-        }
-        let Some(snapshot) = &self.state.snapshot else {
-            return;
-        };
-        let sessions: Vec<_> = snapshot
-            .sessions
-            .iter()
-            .filter(|s| {
-                s.native_reference.is_some() && matches!(s.kind.as_str(), "claude" | "codex")
-            })
-            .cloned()
-            .collect();
-        if sessions.is_empty() {
-            return;
-        }
-        self.activity_busy = true;
-        let reader = self.reader.clone();
-        let sender = self.sender.clone();
-        thread::spawn(move || {
-            let stamps = reader
-                .lock()
-                .map(|mut reader| reader.read(&sessions))
-                .unwrap_or_default();
-            let _ = sender.send(Update::Activity(sessions, stamps));
-        });
-    }
-
     fn request_contents(&mut self) {
-        if self.index_busy || self.opening || self.state.query.trim().is_empty() {
+        if self.index_busy || self.opening || !self.state.needs_contents() {
             return;
         }
+        let client = self.client.clone();
         let Some(snapshot) = &self.state.snapshot else {
             return;
         };
@@ -334,7 +356,7 @@ impl App {
                     cached.pane_id != s.pane_id
                         || cached.kind != s.kind
                         || cached.reference != s.native_reference
-                        || cached.revision != s.revision
+                        || cached.revision < s.revision
                         || cached.read_at.elapsed() >= Duration::from_secs(5)
                 })
             })
@@ -346,7 +368,6 @@ impl App {
         self.index_busy = true;
         self.content_error = false;
         self.dirty = true;
-        let client = self.client.clone();
         let sender = self.sender.clone();
         thread::spawn(move || {
             let documents = client
@@ -358,9 +379,104 @@ impl App {
         });
     }
 
+    fn invalidate_preview(&mut self, clear_capture: bool) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        if let Some(request) = &self.preview_busy {
+            request.client.cancel();
+        }
+        self.preview_due = None;
+        self.preview_error = None;
+        if clear_capture {
+            self.preview_capture = None;
+            self.preview_scroll = 0;
+            self.preview_manual_scroll = false;
+        }
+    }
+
+    fn sync_preview(&mut self) {
+        if !self.preview_visible {
+            if self.preview_target.is_some() {
+                self.invalidate_preview(true);
+                self.preview_target = None;
+            }
+            return;
+        }
+        let selected = self.state.selected().and_then(|row| row.session.clone());
+        let changed = match (&self.preview_target, &selected) {
+            (Some(previous), Some(current)) => !same_preview_target(previous, current),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            let same_session = self
+                .preview_target
+                .as_ref()
+                .zip(selected.as_ref())
+                .is_some_and(|(previous, current)| same_preview_session(previous, current));
+            let previous_scroll = self.preview_scroll;
+            let manual_scroll = self.preview_manual_scroll;
+            self.invalidate_preview(true);
+            if same_session {
+                self.preview_scroll = previous_scroll;
+                self.preview_manual_scroll = manual_scroll;
+            }
+            self.preview_target = selected;
+            self.preview_due = self
+                .preview_target
+                .as_ref()
+                .map(|_| Instant::now() + Duration::from_millis(90));
+            self.dirty = true;
+        }
+    }
+
+    fn request_preview(&mut self) {
+        if self.preview_busy.is_some()
+            || self.opening
+            || !self.preview_visible
+            || !self.preview_due.is_some_and(|due| due <= Instant::now())
+        {
+            return;
+        }
+        let Some(session) = self.preview_target.clone() else {
+            return;
+        };
+        let client = self.client.independent_requests();
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        self.preview_due = None;
+        self.preview_busy = Some(PreviewRequest {
+            generation,
+            client: client.clone(),
+        });
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = client.read_screen(&session);
+            let _ = sender.send(Update::Preview(Box::new(PreviewResponse {
+                generation,
+                session,
+                result,
+            })));
+        });
+        self.dirty = true;
+    }
+
+    fn scroll_preview(&mut self, delta: isize) {
+        let Some(capture) = &self.preview_capture else {
+            return;
+        };
+        let limit = capture.document.lines.len().saturating_sub(1);
+        self.preview_scroll = self.preview_scroll.saturating_add_signed(delta).min(limit);
+        self.preview_manual_scroll = true;
+        self.dirty = true;
+    }
+
     fn query_changed(&mut self) {
         self.state.set_query(self.editor.text.clone());
-        self.index_due = (!self.editor.text.trim().is_empty())
+        self.preview_manual_scroll = false;
+        self.sync_preview();
+        self.index_due = self
+            .state
+            .needs_contents()
             .then(|| Instant::now() + Duration::from_millis(100));
         self.rebuild = true;
         self.reveal = true;
@@ -369,12 +485,14 @@ impl App {
 
     fn move_selection(&mut self, delta: isize) {
         self.state.move_selection(delta);
+        self.sync_preview();
         self.reveal = true;
         self.dirty = true;
     }
 
     fn move_group(&mut self, delta: isize, level: GroupLevel) {
         self.state.move_target(delta, level);
+        self.sync_preview();
         self.reveal = true;
         self.dirty = true;
     }
@@ -396,9 +514,9 @@ impl App {
         let Some(session) = row.session.clone() else {
             return;
         };
+        let client = self.client.clone();
         self.opening = true;
         self.dirty = true;
-        let client = self.client.clone();
         let sender = self.sender.clone();
         thread::spawn(move || {
             let _ = sender.send(Update::Focus(client.focus(&session)));
@@ -445,6 +563,23 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Tab if !self.opening => {
+                self.invalidate_preview(true);
+                self.preview_visible = !self.preview_visible;
+                self.preview_target = None;
+                self.sync_preview();
+                self.rebuild = true;
+                self.dirty = true;
+                return;
+            }
+            KeyCode::Up if alt && self.preview_visible => {
+                self.scroll_preview(-3);
+                return;
+            }
+            KeyCode::Down if alt && self.preview_visible => {
+                self.scroll_preview(3);
+                return;
+            }
             KeyCode::Esc => {
                 if self.search_focus && !self.opening {
                     self.search_focus = false;
@@ -468,6 +603,10 @@ impl App {
                 self.indexed.clear();
                 self.index_due = Some(Instant::now());
                 self.request_snapshot();
+                self.invalidate_preview(false);
+                self.sync_preview();
+                self.preview_due = self.preview_target.as_ref().map(|_| Instant::now());
+                self.dirty = true;
                 return;
             }
             _ => {}
@@ -480,6 +619,10 @@ impl App {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Char('p') if control => self.move_selection(-1),
             KeyCode::Char('n') if control => self.move_selection(1),
+            KeyCode::Enter if self.search_focus => {
+                self.search_focus = false;
+                self.dirty = true;
+            }
             KeyCode::Enter => self.activate(),
             KeyCode::PageUp => self.move_selection(-(self.geometry.list.height.max(1) as isize)),
             KeyCode::PageDown => self.move_selection(self.geometry.list.height.max(1) as isize),
@@ -552,6 +695,7 @@ impl App {
             }
             _ => {}
         }
+        self.sync_preview();
         self.dirty = true;
     }
 
@@ -581,6 +725,13 @@ impl App {
             return;
         }
         if !self.geometry.list.contains(point.into()) {
+            if self.geometry.preview.contains(point.into()) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.scroll_preview(-3),
+                    MouseEventKind::ScrollDown => self.scroll_preview(3),
+                    _ => {}
+                }
+            }
             return;
         }
         match mouse.kind {
@@ -633,6 +784,7 @@ impl App {
             }
             _ => return,
         }
+        self.sync_preview();
         self.dirty = true;
     }
 
@@ -641,11 +793,13 @@ impl App {
             self.messages.get("opening").to_owned()
         } else if !self.error.is_empty() {
             self.error.clone()
+        } else if let Some(error) = &self.state.query_error {
+            error.clone()
         } else if self.state.selection_lost {
             self.messages.get("lost").to_owned()
-        } else if !self.state.query.trim().is_empty() && self.index_busy {
+        } else if self.state.needs_contents() && self.index_busy {
             self.messages.get("indexing").to_owned()
-        } else if !self.state.query.trim().is_empty() && self.content_error {
+        } else if self.state.needs_contents() && self.content_error {
             self.messages.get("partial").to_owned()
         } else {
             String::new()
@@ -653,26 +807,41 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.sync_preview();
         let area = frame.area();
+        frame.render_widget(Block::default().style(self.theme.normal()), area);
         let notice = self.notice();
-        let selected_title = self
-            .state
-            .selected()
-            .map(|row| {
-                row.session
-                    .as_ref()
-                    .map(|session| session.title.as_str())
-                    .unwrap_or_else(|| {
-                        if row.kind == RowKind::Tab {
-                            &row.tab_label
-                        } else {
-                            &row.workspace.label
-                        }
-                    })
-            })
-            .unwrap_or_default()
-            .to_owned();
-
+        let filter_height = u16::from(self.state.status.is_some());
+        let notice_height = u16::from(!notice.is_empty());
+        let available = area
+            .height
+            .saturating_sub(4 + filter_height + notice_height);
+        let side_preview = self.preview_visible && area.width >= 105 && available >= 8;
+        let bottom_preview =
+            self.preview_visible && !side_preview && area.width >= 50 && available >= 16;
+        let has_preview = side_preview || bottom_preview;
+        let details_height = if has_preview {
+            0
+        } else if area.height >= 18 {
+            4
+        } else if area.height >= 12 {
+            3
+        } else if area.height >= 8 {
+            2
+        } else {
+            0
+        };
+        let regions = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(filter_height),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(details_height),
+            Constraint::Length(notice_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
         let margin = if area.width >= 12 {
             2
         } else {
@@ -686,31 +855,7 @@ impl App {
                 rect.height,
             )
         };
-
-        let title_width = area.width.saturating_sub(margin * 2);
-        let title_lines = render::wrapped_cells(
-            &selected_title,
-            title_width as usize,
-            if area.height < 12 { 1 } else { 3 },
-        );
-        let title_height = title_lines.len() as u16;
-
-        frame.render_widget(Block::default().style(self.theme.normal()), area);
-        let regions = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(u16::from(self.state.status.is_some())),
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(title_height),
-            Constraint::Length(if area.height < 14 { 0 } else { 2 }),
-            Constraint::Length(u16::from(!notice.is_empty())),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
         self.draw_search(frame, padded(regions[0]));
-
         for divider in [regions[1], regions[4]] {
             frame.render_widget(
                 Block::default()
@@ -719,7 +864,6 @@ impl App {
                 divider,
             );
         }
-
         if let Some(status) = self.state.status.as_deref() {
             frame.render_widget(
                 Paragraph::new(format!(
@@ -732,27 +876,203 @@ impl App {
                 padded(regions[2]),
             );
         }
-
-        self.draw_list(frame, regions[3]);
-        self.draw_selection_details(frame, title_lines, padded(regions[5]), padded(regions[6]));
-
+        self.geometry.preview = Rect::default();
+        if side_preview {
+            let panes =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(regions[3]);
+            self.draw_list(frame, panes[0]);
+            self.draw_preview(frame, panes[1]);
+        } else if bottom_preview {
+            let panes = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(regions[3]);
+            self.draw_list(frame, panes[0]);
+            self.draw_preview(frame, panes[1]);
+        } else {
+            self.draw_list(frame, regions[3]);
+        }
+        self.geometry.details = padded(regions[5]);
+        self.draw_selection_details(frame, self.geometry.details);
         frame.render_widget(
             Paragraph::new(notice).style(self.theme.accent()),
+            padded(regions[6]),
+        );
+        let footer = if self.search_focus {
+            "Enter browse  Esc browse  ↑↓ select  Tab preview  F1 help"
+        } else if self.preview_visible && !has_preview {
+            "Tab preview  Enlarge terminal for preview  / search  F1 help"
+        } else if has_preview {
+            "Tab preview  Alt+↑↓ scroll  / search  Enter open  F1 help"
+        } else {
+            "Tab preview  / search  Enter open  Esc back/close  F1 help"
+        };
+        frame.render_widget(
+            Paragraph::new(footer).style(self.theme.muted()),
             padded(regions[7]),
         );
-        frame.render_widget(
-            Paragraph::new(self.messages.get(if self.search_focus {
-                "keys"
-            } else {
-                "list_keys"
-            }))
-            .style(self.theme.muted()),
-            padded(regions[8]),
-        );
-
         if self.help {
             self.draw_help(frame, area);
         }
+    }
+
+    fn draw_preview(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.geometry.preview = area;
+        let title = self.state.selected().map_or_else(String::new, |row| {
+            let label = if let Some(session) = &row.session {
+                format!("{} / {}", row.workspace.label, session.title)
+            } else if row.kind == RowKind::Tab {
+                format!("{} / {}", row.workspace.label, row.tab_label)
+            } else {
+                row.workspace.label.clone()
+            };
+            format!(
+                " {} ",
+                render::middle(&label, area.width.saturating_sub(4) as usize)
+            )
+        });
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.separator())
+            .title(ratatui::text::Line::styled(title, self.theme.workspace()));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let Some(row) = self.state.selected() else {
+            return;
+        };
+        if row.session.is_none() {
+            return;
+        }
+        let Some(target) = &self.preview_target else {
+            return;
+        };
+        let capture = self
+            .preview_capture
+            .as_ref()
+            .filter(|capture| same_preview_target(&capture.session, target));
+        let refreshing = self
+            .preview_busy
+            .as_ref()
+            .is_some_and(|request| request.generation == self.preview_generation);
+        let status = if let Some(capture) = capture {
+            format!(
+                "{} read {}s ago{}",
+                if capture.truncated {
+                    "Screen excerpt,"
+                } else {
+                    "Screen,"
+                },
+                capture.read_at.elapsed().as_secs(),
+                if refreshing { ", refreshing" } else { "" }
+            )
+        } else if self.preview_error.is_some() {
+            "Screen unavailable. Ctrl+R retries.".to_owned()
+        } else if !row.snippets.is_empty() {
+            "Search excerpt, loading selected screen...".to_owned()
+        } else {
+            "Loading selected screen...".to_owned()
+        };
+        let details_height = if inner.height >= 10 {
+            4
+        } else if inner.height >= 7 {
+            3
+        } else {
+            2
+        };
+        let details = render::selection_lines(
+            row,
+            inner.width as usize,
+            details_height as usize + 1,
+            self.theme,
+        )
+        .into_iter()
+        .skip(1)
+        .collect::<Vec<_>>();
+        let parts = Layout::vertical([
+            Constraint::Length(details.len() as u16),
+            Constraint::Length(1),
+            Constraint::Length(u16::from(self.preview_error.is_some())),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+        frame.render_widget(Paragraph::new(details), parts[0]);
+        frame.render_widget(
+            Paragraph::new(render::clip(&status, parts[1].width as usize))
+                .style(self.theme.muted()),
+            parts[1],
+        );
+        if let Some(error) = &self.preview_error {
+            let prefix = if capture.is_some() {
+                "Refresh failed"
+            } else {
+                "Read failed"
+            };
+            let message = format!("{prefix}: {}", error.message);
+            frame.render_widget(
+                Paragraph::new(render::clip(&message, parts[2].width as usize))
+                    .style(self.theme.accent()),
+                parts[2],
+            );
+        }
+        let Some(capture) = capture else {
+            let lines = row
+                .snippets
+                .iter()
+                .take(parts[3].height as usize)
+                .map(|line| {
+                    render::preview_line(
+                        line,
+                        &row.query_terms,
+                        parts[3].width as usize,
+                        self.theme,
+                    )
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), parts[3]);
+            return;
+        };
+        let document = &capture.document;
+        if document.text.is_empty() {
+            frame.render_widget(
+                Paragraph::new("The visible screen is empty.").style(self.theme.muted()),
+                parts[3],
+            );
+            return;
+        }
+        let terms = row.query_terms.as_slice();
+        if !self.preview_manual_scroll && parts[3].height > 0 {
+            let tail = document
+                .lines
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+                .map_or(0, |line| {
+                    line.saturating_add(1)
+                        .saturating_sub(parts[3].height as usize)
+                });
+            self.preview_scroll = document
+                .lines
+                .iter()
+                .position(|line| !highlight_spans_terms(line, terms).is_empty())
+                .map_or(tail, |line| {
+                    line.saturating_sub(parts[3].height as usize / 2)
+                });
+        }
+        self.preview_scroll = self.preview_scroll.min(
+            document
+                .lines
+                .len()
+                .saturating_sub(parts[3].height as usize),
+        );
+        let lines = document
+            .lines
+            .iter()
+            .skip(self.preview_scroll)
+            .take(parts[3].height as usize)
+            .map(|line| render::preview_line(line, terms, parts[3].width as usize, self.theme))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), parts[3]);
     }
 
     fn draw_search(&mut self, frame: &mut Frame<'_>, search: Rect) {
@@ -944,78 +1264,16 @@ impl App {
         }
     }
 
-    fn draw_selection_details(
-        &self,
-        frame: &mut Frame<'_>,
-        title_lines: Vec<String>,
-        title_area: Rect,
-        context_area: Rect,
-    ) {
+    fn draw_selection_details(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(row) = self.state.selected() {
             frame.render_widget(
-                Paragraph::new(
-                    title_lines
-                        .into_iter()
-                        .map(ratatui::text::Line::raw)
-                        .collect::<Vec<_>>(),
-                )
-                .style(self.theme.normal().add_modifier(Modifier::BOLD)),
-                title_area,
-            );
-
-            let mut parts = vec![row.workspace.label.clone()];
-            if let Some(session) = &row.session {
-                if let Some(at) = session.activity_at {
-                    parts.insert(
-                        0,
-                        format!(
-                            "{} {}",
-                            self.messages.get("conversation"),
-                            at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-                        ),
-                    );
-                }
-
-                let provider_label = if session.display_kind.eq_ignore_ascii_case(&session.kind) {
-                    render::provider_label(&session.kind, &session.display_kind)
-                } else {
-                    session.display_kind.clone()
-                };
-                for value in [&session.tab_label, &session.name, &provider_label] {
-                    if !value.is_empty() && value != &session.title && !parts.contains(value) {
-                        parts.push(value.clone());
-                    }
-                }
-
-                if session.activity_at.is_none() && session.kind != "terminal" {
-                    parts.insert(
-                        0,
-                        self.messages
-                            .get(if session.native_reference.is_none() {
-                                "date_unlinked"
-                            } else {
-                                "date_unknown"
-                            })
-                            .to_owned(),
-                    );
-                }
-            } else if row.kind == RowKind::Workspace {
-                parts.clear();
-            }
-
-            frame.render_widget(
-                Paragraph::new(
-                    render::wrapped_cells(
-                        &parts.join(" | "),
-                        context_area.width as usize,
-                        context_area.height as usize,
-                    )
-                    .into_iter()
-                    .map(ratatui::text::Line::raw)
-                    .collect::<Vec<_>>(),
-                )
-                .style(self.theme.muted()),
-                context_area,
+                Paragraph::new(render::selection_lines(
+                    row,
+                    area.width as usize,
+                    area.height as usize,
+                    self.theme,
+                )),
+                area,
             );
         }
     }
@@ -1094,12 +1352,18 @@ impl Drop for Restore {
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(request) = &self.preview_busy {
+            request.client.cancel();
+        }
         self.client.cancel();
     }
 }
 
 pub fn run(client: Client) -> Result<(), Box<dyn Error>> {
-    let mut app = App::new(client, true);
+    run_app(App::new(client, true))
+}
+
+fn run_app(mut app: App) -> Result<(), Box<dyn Error>> {
     let _restore = Restore;
     let mut terminal = ratatui::try_init()?;
     execute!(
@@ -1166,7 +1430,6 @@ mod tests {
     use super::*;
     use crate::model::{Tab, Workspace};
     use chrono::{TimeZone, Utc};
-    use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
 
     // Two wide syllables and a combining sequence stress byte offsets and cell widths.
@@ -1256,6 +1519,7 @@ mod tests {
             false,
         );
         app.state.update(fixture());
+        app.preview_visible = false;
         app
     }
 
@@ -1263,6 +1527,588 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         terminal
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn preview_title_follows_native_context_and_group_selection_keeps_a_blank_frame() {
+        let mut app = app();
+        app.preview_visible = true;
+        let terminal = paint(&mut app, 120, 32);
+        let preview = app.geometry.preview;
+        assert!(screen(&terminal).contains("App / Fix payment routing"));
+        assert!(!screen(&terminal).contains("Selected session"));
+        for (key, title) in [("w:a", "App"), ("t:ta", "App / API")] {
+            assert!(app.state.select(key));
+            let terminal = paint(&mut app, 120, 32);
+            assert_eq!(app.geometry.preview, preview);
+            let text = screen(&terminal);
+            assert!(
+                text.lines()
+                    .nth(preview.y as usize)
+                    .unwrap()
+                    .contains(title)
+            );
+            assert!(!text.contains("Enter or Space"));
+            for y in preview.y + 1..preview.bottom() - 1 {
+                for x in preview.x + 1..preview.right() - 1 {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enter_finishes_search_without_opening_and_a_second_press_opens_the_selection() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        app.editor.insert("payment");
+        app.query_changed();
+        let selected = app.state.selected_key().map(str::to_owned);
+        assert!(screen(&paint(&mut app, 120, 32)).contains("Enter browse"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.search_focus && !app.opening && !app.quit);
+        assert_eq!(app.state.query, "payment");
+        assert_eq!(app.state.selected_key(), selected.as_deref());
+        let mut repeat = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        repeat.kind = event::KeyEventKind::Repeat;
+        app.key(repeat);
+        assert!(!app.opening && !app.quit);
+        assert!(screen(&paint(&mut app, 120, 32)).contains("Enter open"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.opening && !app.quit);
+    }
+
+    #[test]
+    fn default_view_keeps_grouped_rows_and_enables_preview() {
+        let mut app = App::new(
+            Client::new("/nonexistent/finder-default", Duration::from_millis(5)).unwrap(),
+            false,
+        );
+        assert!(app.preview_visible);
+        app.state.update(fixture());
+        paint(&mut app, 120, 32);
+        assert!(!app.geometry.preview.is_empty());
+        assert!(app.geometry.details.is_empty());
+        assert!(
+            app.state
+                .rows()
+                .iter()
+                .any(|row| row.kind == RowKind::Workspace)
+        );
+        assert!(app.state.rows().iter().any(|row| row.kind == RowKind::Tab));
+        for key in ["s:one", "s:two", "s:three"] {
+            assert_eq!(
+                app.lines
+                    .iter()
+                    .filter(|line| line.key.as_deref() == Some(key))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_only_and_invalid_queries_do_not_index_all_screens() {
+        let mut app = app();
+        for query in [
+            "agent:codex",
+            "status:working",
+            "path:shared",
+            "screen:\"unfinished",
+        ] {
+            app.state.set_query(query.into());
+            assert!(!app.state.needs_contents());
+            app.request_contents();
+            assert!(!app.index_busy);
+        }
+        app.state.set_query("payment".into());
+        assert!(app.state.needs_contents());
+    }
+
+    #[test]
+    fn fuzzy_search_preserves_workspace_and_tab_headers_with_compact_sessions() {
+        let mut app = app();
+        app.editor.insert("pymnt");
+        app.query_changed();
+        paint(&mut app, 80, 32);
+        assert!(
+            app.state
+                .rows()
+                .iter()
+                .any(|row| row.kind == RowKind::Workspace && row.workspace.label == "App")
+        );
+        for key in ["t:ta", "t:tb", "s:one", "s:two"] {
+            assert_eq!(
+                app.lines
+                    .iter()
+                    .filter(|line| line.key.as_deref() == Some(key))
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            app.lines
+                .iter()
+                .all(|line| line.key.as_deref() != Some("s:three"))
+        );
+    }
+
+    #[test]
+    fn preview_reflows_right_below_and_hidden_on_small_terminals() {
+        let mut app = preview_app();
+        paint(&mut app, 120, 32);
+        assert!(app.geometry.preview.x > app.geometry.list.x);
+        assert_eq!(app.geometry.preview.y, app.geometry.list.y);
+        assert!(app.geometry.details.is_empty());
+        paint(&mut app, 80, 40);
+        assert!(app.geometry.preview.y > app.geometry.list.y);
+        assert_eq!(app.geometry.preview.x, app.geometry.list.x);
+        paint(&mut app, 30, 12);
+        assert!(app.geometry.preview.is_empty());
+        assert!(!app.geometry.details.is_empty());
+        for (width, height) in [(0, 0), (1, 1), (8, 6), (40, 12)] {
+            paint(&mut app, width, height);
+        }
+    }
+
+    fn capture(text: &str, revision: u64, truncated: bool) -> ScreenCapture {
+        ScreenCapture {
+            text: text.into(),
+            revision,
+            truncated,
+        }
+    }
+
+    fn preview_response(
+        generation: u64,
+        session: Session,
+        result: Result<ScreenCapture, FinderError>,
+    ) -> Update {
+        Update::Preview(Box::new(PreviewResponse {
+            generation,
+            session,
+            result,
+        }))
+    }
+
+    fn preview_app() -> App {
+        let mut app = app();
+        app.preview_visible = true;
+        app.sync_preview();
+        app
+    }
+
+    fn mark_preview_busy(app: &mut App) -> Client {
+        let client = app.client.independent_requests();
+        app.preview_busy = Some(PreviewRequest {
+            generation: app.preview_generation,
+            client: client.clone(),
+        });
+        app.preview_due = None;
+        client
+    }
+
+    #[test]
+    fn preview_drops_responses_for_old_selection_address_and_revision() {
+        let mut app = preview_app();
+        let origin = app.preview_target.clone().unwrap();
+        let generation = app.preview_generation;
+        mark_preview_busy(&mut app);
+        app.state.select("s:two");
+        app.sync_preview();
+        app.receive(preview_response(
+            generation,
+            origin,
+            Ok(capture("old secret screen", 17, false)),
+        ));
+        assert!(app.preview_busy.is_none());
+        assert!(app.preview_capture.is_none());
+        let current = app.preview_target.clone().unwrap();
+        let generation = app.preview_generation;
+        let mut wrong_address = current.clone();
+        wrong_address.pane_id = "moved".into();
+        app.receive(preview_response(
+            generation,
+            wrong_address,
+            Ok(capture("wrong address", 17, false)),
+        ));
+        let mut wrong_revision = current.clone();
+        wrong_revision.revision += 1;
+        app.receive(preview_response(
+            generation,
+            wrong_revision,
+            Ok(capture("wrong revision", 17, false)),
+        ));
+        assert!(app.preview_capture.is_none());
+        app.receive(preview_response(
+            generation,
+            current,
+            Ok(capture("current selected screen", 17, false)),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("current selected screen"));
+        assert!(!text.contains("rev 17"));
+        assert!(!text.contains("old secret screen"));
+        assert!(!text.contains("wrong address") && !text.contains("wrong revision"));
+    }
+
+    #[test]
+    fn current_preview_updates_search_evidence_and_vanished_match_becomes_inert() {
+        let mut app = preview_app();
+        let origin = app.state.snapshot.as_ref().unwrap().sessions.clone();
+        app.state.set_query("screen:needle".into());
+        app.state.set_contents(
+            HashMap::from([("one".into(), ContentDocument::new("old needle evidence"))]),
+            &origin,
+        );
+        app.sync_preview();
+        let selected = app.preview_target.clone().unwrap();
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture("new needle evidence", 2, false)),
+        ));
+        assert_eq!(
+            app.state.content(&selected).unwrap().text,
+            "new needle evidence"
+        );
+        assert!(
+            app.state
+                .selected()
+                .unwrap()
+                .snippets
+                .iter()
+                .any(|line| line.contains("new needle evidence"))
+        );
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture("screen no longer matches", 3, false)),
+        ));
+        assert!(app.state.selected().is_none() && app.state.selection_lost);
+        assert!(app.preview_target.is_none());
+        app.activate();
+        assert!(!app.opening);
+    }
+
+    #[test]
+    fn preview_generation_rejects_a_to_b_to_a_without_cancelling_main_client() {
+        use std::sync::atomic::Ordering;
+        let mut app = preview_app();
+        let origin = app.preview_target.clone().unwrap();
+        let old_generation = app.preview_generation;
+        let independent = mark_preview_busy(&mut app);
+        app.state.select("s:two");
+        app.sync_preview();
+        app.state.select("s:one");
+        app.sync_preview();
+        assert!(app.preview_generation > old_generation);
+        assert!(independent.cancellation().load(Ordering::Acquire));
+        assert!(!app.client.cancellation().load(Ordering::Acquire));
+        app.receive(preview_response(
+            old_generation,
+            origin.clone(),
+            Ok(capture("obsolete A response", 1, false)),
+        ));
+        assert!(app.preview_capture.is_none());
+        app.receive(preview_response(
+            app.preview_generation,
+            origin,
+            Ok(capture("new A response", 2, false)),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("new A response"));
+        assert!(!text.contains("obsolete A response"));
+    }
+
+    #[test]
+    fn hidden_and_reopened_preview_rejects_previous_generation() {
+        let mut app = preview_app();
+        let origin = app.preview_target.clone().unwrap();
+        let generation = app.preview_generation;
+        mark_preview_busy(&mut app);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        app.receive(preview_response(
+            generation,
+            origin.clone(),
+            Ok(capture("hidden response", 1, false)),
+        ));
+        assert!(app.preview_capture.is_none());
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.preview_generation > generation);
+        app.receive(preview_response(
+            generation,
+            origin.clone(),
+            Ok(capture("reopened stale response", 1, false)),
+        ));
+        assert!(app.preview_capture.is_none());
+        app.receive(preview_response(
+            app.preview_generation,
+            origin,
+            Ok(capture("reopened current response", 2, false)),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("reopened current response"));
+        assert!(!text.contains("hidden response") && !text.contains("reopened stale response"));
+    }
+
+    #[test]
+    fn preview_debounces_selection_and_distinguishes_loading_unavailable_and_empty() {
+        let mut app = preview_app();
+        app.request_preview();
+        assert!(app.preview_busy.is_none());
+        assert!(screen(&paint(&mut app, 120, 32)).contains("Loading selected screen"));
+        let selected = app.preview_target.clone().unwrap();
+        let generation = app.preview_generation;
+        app.receive(preview_response(
+            generation,
+            selected.clone(),
+            Err(FinderError::new("timeout", "Read timed out")),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("Screen unavailable") && text.contains("Read timed out"));
+        app.receive(preview_response(
+            generation,
+            selected,
+            Ok(capture("", 1, false)),
+        ));
+        assert!(screen(&paint(&mut app, 120, 32)).contains("visible screen is empty"));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_capture_age_and_labels_screen_excerpt() {
+        let mut app = preview_app();
+        let selected = app.preview_target.clone().unwrap();
+        let generation = app.preview_generation;
+        app.receive(preview_response(
+            generation,
+            selected.clone(),
+            Ok(capture("kept screen evidence", 42, true)),
+        ));
+        let captured_at = Instant::now() - Duration::from_secs(9);
+        app.preview_capture.as_mut().unwrap().read_at = captured_at;
+        app.invalidate_preview(false);
+        assert!(app.preview_generation > generation);
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Err(FinderError::new("timeout", "Retry timed out")),
+        ));
+        assert_eq!(app.preview_capture.as_ref().unwrap().read_at, captured_at);
+        let text = screen(&paint(&mut app, 140, 32));
+        assert!(text.contains("Screen excerpt, read") && text.contains("s ago"));
+        assert!(text.contains("Refresh failed: Retry timed out"));
+        assert!(text.contains("kept screen evidence"));
+    }
+
+    #[test]
+    fn preview_shortcuts_scroll_and_toggle_without_editing_the_query() {
+        let mut app = preview_app();
+        app.editor.insert("api");
+        app.query_changed();
+        let selected = app.state.selected().unwrap().session.clone().unwrap();
+        let contents = (0..80)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture(&contents, 0, false)),
+        ));
+        paint(&mut app, 120, 32);
+        let initial_scroll = app.preview_scroll;
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.preview_scroll, initial_scroll - 3);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        paint(&mut app, 120, 32);
+        assert!(app.geometry.preview.is_empty());
+        assert!(!app.geometry.details.is_empty());
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        paint(&mut app, 120, 32);
+        assert!(!app.geometry.preview.is_empty());
+        assert_eq!(app.state.query, "api");
+        assert_eq!(app.editor.text, "api");
+    }
+
+    #[test]
+    fn preview_follows_latest_output_until_the_user_scrolls() {
+        let mut app = preview_app();
+        let selected = app.preview_target.clone().unwrap();
+        app.scroll_preview(3);
+        assert!(!app.preview_manual_scroll);
+        let contents = |count: usize, marker: &str| {
+            (0..count)
+                .map(|index| {
+                    if index + 1 == count {
+                        marker.to_owned()
+                    } else {
+                        format!("output line {index}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture(&contents(80, "latest initial output"), 0, false)),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("latest initial output"));
+        let initial_scroll = app.preview_scroll;
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture(&contents(90, "latest refreshed output"), 0, false)),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains("latest refreshed output"));
+        assert!(app.preview_scroll > initial_scroll);
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        let manual_scroll = app.preview_scroll;
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture(
+                &contents(100, "new output after manual scroll"),
+                0,
+                false,
+            )),
+        ));
+        let text = screen(&paint(&mut app, 120, 32));
+        assert_eq!(app.preview_scroll, manual_scroll);
+        assert!(!text.contains("new output after manual scroll"));
+        app.editor.insert("title:payment");
+        app.query_changed();
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(!app.preview_manual_scroll);
+        assert!(text.contains("new output after manual scroll"));
+        let area = app.geometry.preview;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let wheel_scroll = app.preview_scroll;
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture(
+                &contents(110, "new output after wheel scroll"),
+                0,
+                false,
+            )),
+        ));
+        paint(&mut app, 120, 32);
+        assert!(app.preview_manual_scroll);
+        assert_eq!(app.preview_scroll, wheel_scroll);
+    }
+
+    #[test]
+    fn preview_centers_literal_evidence_once_and_preserves_manual_scroll_on_refresh() {
+        let mut app = preview_app();
+        let selected = app.preview_target.clone().unwrap();
+        let text = (0..80)
+            .map(|index| {
+                if index == 50 {
+                    "needle evidence".to_owned()
+                } else {
+                    format!("line {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.state.set_contents(
+            HashMap::from([(selected.terminal_id.clone(), ContentDocument::new(&text))]),
+            std::slice::from_ref(&selected),
+        );
+        app.editor.insert("needle");
+        app.query_changed();
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture(&text, 7, false)),
+        ));
+        assert!(screen(&paint(&mut app, 120, 32)).contains("needle evidence"));
+        assert!(app.preview_scroll > 0);
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        let manual = app.preview_scroll;
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture(&text, 8, false)),
+        ));
+        paint(&mut app, 120, 32);
+        assert_eq!(app.preview_scroll, manual);
+        let mut snapshot = app.state.snapshot.clone().unwrap();
+        snapshot
+            .sessions
+            .iter_mut()
+            .find(|session| session.terminal_id == "one")
+            .unwrap()
+            .revision += 1;
+        app.state.update(snapshot);
+        app.sync_preview();
+        let revised = app.preview_target.clone().unwrap();
+        app.receive(preview_response(
+            app.preview_generation,
+            revised,
+            Ok(capture(&text, 9, false)),
+        ));
+        paint(&mut app, 120, 32);
+        assert_eq!(app.preview_scroll, manual);
+    }
+
+    #[test]
+    fn refreshing_preview_does_not_enqueue_a_second_read_for_the_same_capture() {
+        let mut app = preview_app();
+        let selected = app.preview_target.clone().unwrap();
+        app.receive(preview_response(
+            app.preview_generation,
+            selected.clone(),
+            Ok(capture("cached screen", 1, false)),
+        ));
+        mark_preview_busy(&mut app);
+        app.sync_preview();
+        assert!(app.preview_due.is_none());
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture("fresh screen", 2, false)),
+        ));
+        app.sync_preview();
+        assert!(app.preview_busy.is_none());
+        assert!(app.preview_due.is_some_and(|due| due > Instant::now()));
+    }
+
+    #[test]
+    fn invalid_query_is_visible_and_does_not_start_screen_indexing() {
+        let mut app = app();
+        app.editor.insert("screen:\"unfinished");
+        app.query_changed();
+        assert!(app.state.query_error.is_some());
+        assert!(app.state.rows().is_empty());
+        let notice = app.notice();
+        assert!(!notice.is_empty());
+        let text = screen(&paint(&mut app, 120, 32));
+        assert!(text.contains(&notice));
+        app.request_contents();
+        assert!(!app.index_busy);
     }
 
     fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -1421,79 +2267,73 @@ mod tests {
     }
 
     #[test]
-    fn narrow_popup_keeps_the_selected_title_in_two_lines() {
-        // The two-cell ideograph crosses the 31-cell padded footer boundary.
-        let wide_title = format!("{}\u{754c}", "x".repeat(30));
-        for title in [
-            "Verify payment settlement and refund".to_owned(),
-            wide_title,
-        ] {
-            let mut app = app();
-            let mut snapshot = fixture();
-            snapshot.sessions[0].title = title.clone();
-            app.state.update(snapshot);
-            let terminal = paint(&mut app, 35, 17);
-            let buffer = terminal.backend().buffer();
-            let displayed: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-            assert!(
-                displayed
-                    .split_whitespace()
-                    .collect::<String>()
-                    .contains(&title.split_whitespace().collect::<String>())
-            );
-
-            // A buffer can hold a wide symbol even when its final cell would exceed the text area.
-            for y in app.geometry.list.bottom() + 1..17 {
-                for x in 2..33 {
-                    assert!(x as usize + render::width(buffer[(x, y)].symbol()) <= 33);
-                }
-                for x in [0, 1, 33, 34] {
-                    assert_eq!(buffer[(x, y)].symbol(), " ");
-                }
+    fn narrow_popup_keeps_selected_details_inside_padded_cells() {
+        let mut app = app();
+        let mut snapshot = fixture();
+        snapshot.sessions[0].title = format!("{}界", "x".repeat(30));
+        snapshot.sessions[0].cwd = "/project/payment".into();
+        app.state.update(snapshot);
+        let terminal = paint(&mut app, 35, 17);
+        let buffer = terminal.backend().buffer();
+        assert!(screen(&terminal).contains("/project/payment"));
+        for y in app.geometry.details.y..app.geometry.details.bottom() {
+            for x in 2..33 {
+                assert!(x as usize + render::width(buffer[(x, y)].symbol()) <= 33);
+            }
+            for x in [0, 1, 33, 34] {
+                assert_eq!(buffer[(x, y)].symbol(), " ");
             }
         }
     }
 
     #[test]
-    fn body_matches_keep_a_muted_quote_and_terminal_background_when_selected() {
-        let mut app = app();
-        app.theme = Theme::new(true);
-        app.state.set_query("needle".into());
-        let origin = app.state.snapshot.as_ref().unwrap().sessions.clone();
+    fn only_selected_session_shows_path_reason_and_screen_evidence() {
+        let mut app = preview_app();
+        let mut snapshot = fixture();
+        snapshot.sessions[0].cwd = "/selected/payment".into();
+        snapshot.sessions[2].cwd = "/unselected/logs".into();
+        app.state.update(snapshot.clone());
+        app.state.set_query("screen:needle".into());
         app.state.set_contents(
             HashMap::from([
-                ("one".into(), ContentDocument::new("first needle context")),
-                ("three".into(), ContentDocument::new("other needle context")),
+                (
+                    "one".into(),
+                    ContentDocument::new("selected needle evidence"),
+                ),
+                (
+                    "three".into(),
+                    ContentDocument::new("unselected needle evidence"),
+                ),
             ]),
-            &origin,
+            &snapshot.sessions,
         );
         app.state.select("s:one");
-        let terminal = paint(&mut app, 80, 40);
-        for key in ["s:one", "s:three"] {
-            let index = app
-                .lines
+        app.sync_preview();
+        let selected = app.state.selected().unwrap().session.clone().unwrap();
+        app.receive(preview_response(
+            app.preview_generation,
+            selected,
+            Ok(capture("selected needle evidence", 0, false)),
+        ));
+        let terminal = paint(&mut app, 120, 40);
+        let text = screen(&terminal);
+        assert!(text.contains("/selected/payment"));
+        assert!(text.contains("selected needle evidence"));
+        assert!(!text.contains("/unselected/logs") && !text.contains("unselected needle evidence"));
+        assert!(
+            app.lines
                 .iter()
-                .position(|line| line.key.as_deref() == Some(key))
-                .unwrap()
-                + 1;
-            let y = app.geometry.list.y + (index - app.scroll) as u16;
-            let bar = &terminal.backend().buffer()[(app.geometry.list.x + 10, y)];
-            let content = &terminal.backend().buffer()[(app.geometry.list.x + 12, y)];
-            assert_eq!(bar.symbol(), "│");
-            assert_eq!(content.bg, Color::Reset);
-            assert!(content.modifier.contains(Modifier::DIM));
-            assert!(!content.modifier.contains(Modifier::BOLD));
-            let highlighted = (app.geometry.list.x..app.geometry.list.right())
-                .map(|x| &terminal.backend().buffer()[(x, y)])
-                .filter(|cell| cell.modifier.contains(Modifier::UNDERLINED))
-                .collect::<Vec<_>>();
-            assert_eq!(highlighted.len(), "needle".len());
-            assert!(
-                highlighted
-                    .iter()
-                    .all(|cell| cell.modifier.contains(Modifier::BOLD))
-            );
-        }
+                .all(|line| !line.text.to_string().contains("evidence")
+                    && !line.text.to_string().contains("/selected/payment"))
+        );
+        assert!(terminal.backend().buffer().content.iter().any(|cell| {
+            cell.modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        }));
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        let text = screen(&paint(&mut app, 80, 24));
+        assert!(text.contains("/selected/payment") && text.contains("needle"));
+        assert!(app.geometry.preview.is_empty() && !app.geometry.details.is_empty());
     }
 
     #[test]
@@ -1513,17 +2353,11 @@ mod tests {
     }
 
     #[test]
-    fn date_reason_is_visible_before_long_context_and_plain_terminals_omit_it() {
+    fn session_details_omit_missing_activity_metadata() {
         let mut app = app();
-        let mut snapshot = fixture();
-        snapshot.workspaces[0].label = "Long project workspace name".repeat(3);
-        snapshot.sessions[0].tab_label = "Detailed service tab name".repeat(3);
-        app.state.update(snapshot);
-        let terminal = paint(&mut app, 40, 24);
-        assert!(format!("{:?}", terminal.backend().buffer()).contains("Date unlinked"));
-        app.state.select("s:three");
-        let terminal = paint(&mut app, 40, 24);
-        assert!(!format!("{:?}", terminal.backend().buffer()).contains("Date unlinked"));
+        let text = screen(&paint(&mut app, 80, 24));
+        assert!(text.contains("/shared"));
+        assert!(!text.contains("Date unlinked") && !text.contains("Date unavailable"));
     }
 
     #[test]
@@ -1543,17 +2377,14 @@ mod tests {
     }
 
     #[test]
-    fn tree_render_uses_inline_counts_badges_and_muted_dates_without_an_inner_title() {
+    fn tree_rows_keep_counts_and_badges_without_session_metadata_lines() {
         let mut app = app();
         app.theme = Theme::new(true);
         let mut snapshot = fixture();
         snapshot.sessions[0].activity_at =
             Some(Utc.with_ymd_and_hms(2026, 11, 8, 7, 43, 0).unwrap());
         app.state.update(snapshot);
-        let terminal = paint(&mut app, 100, 40);
-        let text = format!("{:?}", terminal.backend().buffer());
-        assert!(!text.contains("Herdr Finder"));
-        assert!(!text.contains("Workspace navigator"));
+        paint(&mut app, 100, 40);
         let workspace = app
             .lines
             .iter()
@@ -1568,6 +2399,15 @@ mod tests {
             .unwrap();
         assert_eq!(tab.text.to_string(), "    ▾ API (1)");
         assert_eq!(tab.text.spans[1].style.fg, app.theme.tab().fg);
+        for key in ["s:one", "s:two", "s:three"] {
+            assert_eq!(
+                app.lines
+                    .iter()
+                    .filter(|line| line.key.as_deref() == Some(key))
+                    .count(),
+                1
+            );
+        }
         assert!(
             app.lines
                 .iter()
@@ -1578,34 +2418,19 @@ mod tests {
                 .iter()
                 .any(|line| line.text.to_string().contains("[Claude]"))
         );
-        let date = app
-            .lines
-            .iter()
-            .find(|line| line.text.to_string().contains("2026-11-08"))
-            .unwrap();
-        assert_eq!(date.text.style.fg, app.theme.muted().fg);
-        let date_index = app
-            .lines
-            .iter()
-            .position(|line| std::ptr::eq(line, date))
-            .unwrap();
-        let y = app.geometry.list.y + (date_index - app.scroll) as u16;
-        let cell = &terminal.backend().buffer()[(app.geometry.list.x + 8, y)];
-        assert_eq!(cell.symbol(), "2");
-        assert!(!cell.modifier.contains(Modifier::REVERSED));
-        assert_eq!(Some(cell.fg), app.theme.muted().fg);
-        assert_eq!(Some(cell.bg), app.theme.selected().bg);
-        assert_ne!(cell.bg, Color::Rgb(255, 255, 255));
+        assert!(app.lines.iter().all(|line| {
+            let text = line.text.to_string();
+            !text.contains("2026-11-08")
+                && !text.contains("/shared")
+                && !text.contains("builder")
+                && !text.contains("reviewer")
+        }));
     }
 
     #[test]
-    fn terminal_resize_rebuilds_actual_width_and_keeps_known_dates_and_literal_snippets() {
+    fn terminal_resize_keeps_rows_compact_and_selected_literal_evidence_visible() {
         let mut app = app();
-        let mut snapshot = fixture();
-        snapshot.sessions[0].activity_at =
-            Some(Utc.with_ymd_and_hms(2026, 11, 8, 7, 43, 0).unwrap());
-        app.state.update(snapshot);
-        app.state.set_query("needle".into());
+        app.state.set_query("screen:needle".into());
         let origin = app.state.snapshot.as_ref().unwrap().sessions.clone();
         app.state.set_contents(
             HashMap::from([(
@@ -1617,25 +2442,23 @@ mod tests {
         for width in [40, 160, 80, 40, 12] {
             app.rebuild = true;
             app.reveal = true;
-            paint(&mut app, width, 24);
+            let terminal = paint(&mut app, width, 24);
             assert!(
                 app.lines
                     .iter()
-                    .all(|line| line.text.width() <= width as usize)
+                    .all(|line| line.text.width() <= app.geometry.list.width as usize)
             );
-            assert!(app.lines.iter().any(|line| {
-                line.text.spans.iter().any(|span| {
-                    span.style
-                        .add_modifier
-                        .contains(Modifier::BOLD | Modifier::UNDERLINED)
-                })
+            assert_eq!(
+                app.lines
+                    .iter()
+                    .filter(|line| line.key.as_deref() == Some("s:one"))
+                    .count(),
+                1
+            );
+            assert!(terminal.backend().buffer().content.iter().any(|cell| {
+                cell.modifier
+                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
             }));
-            assert!(
-                app.lines
-                    .iter()
-                    .any(|line| line.text.to_string().contains("2026-11-08"))
-                    || width < 16
-            );
         }
     }
 
@@ -1735,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn late_body_match_is_selected_and_replaced_activity_is_discarded() {
+    fn late_body_match_is_selected_and_replaced_terminal_content_is_discarded() {
         let mut app = app();
         app.editor.insert("bodyneedle");
         app.query_changed();
@@ -1747,16 +2570,16 @@ mod tests {
         ));
         assert_eq!(app.state.selected_key(), Some("s:three"));
         let mut stale = origin[0].clone();
+        stale.kind = "claude".into();
         stale.native_reference = Some(("claude".into(), "id".into(), "old".into()));
-        let stamp = ActivityStamp {
-            at: Utc::now(),
-            source: "claude_jsonl".into(),
-        };
-        app.receive(Update::Activity(
+        app.receive(Update::Contents(
             vec![stale],
-            HashMap::from([("one".into(), stamp)]),
+            HashMap::from([(
+                "one".into(),
+                ContentDocument::new("bodyneedle replaced terminal"),
+            )]),
         ));
-        assert!(!app.stamps.contains_key("one"));
+        assert!(app.state.rows().iter().all(|row| row.key != "s:one"));
     }
 
     #[test]
@@ -1776,21 +2599,16 @@ mod tests {
     }
 
     #[test]
-    fn spacer_at_viewport_top_keeps_following_group_when_a_date_arrives_above() {
+    fn spacer_at_viewport_top_keeps_following_group_during_metadata_refresh() {
         let mut app = app();
         let mut snapshot = fixture();
         let seeds = snapshot.sessions.clone();
         snapshot.sessions = (0..90)
-            .map(|i| {
-                let seed = &seeds[i / 30];
-                Session {
-                    terminal_id: format!("term-{i}"),
-                    pane_id: format!("pane-{i}"),
-                    focused: i == 0,
-                    native_reference: (i == 0)
-                        .then(|| ("claude".into(), "id".into(), "known".into())),
-                    ..seed.clone()
-                }
+            .map(|index| Session {
+                terminal_id: format!("term-{index}"),
+                pane_id: format!("pane-{index}"),
+                focused: index == 0,
+                ..seeds[index / 30].clone()
             })
             .collect();
         app.state.update(snapshot.clone());
@@ -1802,16 +2620,9 @@ mod tests {
             .unwrap();
         app.reveal = false;
         paint(&mut app, 80, 24);
-        assert!(app.lines[app.scroll].key.is_none());
         let following = app.lines[app.scroll + 1].key.clone();
-        let stamp = ActivityStamp {
-            at: Utc::now(),
-            source: "claude_jsonl".into(),
-        };
-        app.receive(Update::Activity(
-            vec![snapshot.sessions[0].clone()],
-            HashMap::from([("term-0".into(), stamp)]),
-        ));
+        snapshot.sessions[0].activity_at = Some(Utc::now());
+        app.receive(Update::Snapshot(Ok(snapshot)));
         paint(&mut app, 80, 24);
         assert!(app.lines[app.scroll].key.is_none());
         assert_eq!(app.lines[app.scroll + 1].key, following);

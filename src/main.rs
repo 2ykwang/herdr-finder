@@ -43,7 +43,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "help" | "--help" | "-h" => print_help(),
         "shortcut" => println!("{}", shortcut()),
         "open" => Client::from_env()?.open_popup()?,
-        "run" => ui::run(Client::from_env()?)?,
+        "run" => ui::run(Client::from_env()?.excluding_caller())?,
         other => return Err(format!("Unknown command: {other}").into()),
     }
     Ok(())
