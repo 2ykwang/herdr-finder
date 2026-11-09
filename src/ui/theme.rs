@@ -1,4 +1,4 @@
-//! ANSI accents with neutral shades derived from terminal foreground and background.
+//! Terminal palette accents with neutral shades derived from foreground and background.
 
 use super::terminal_colors::TerminalColors;
 use crate::provider::{self, ColorRole};
@@ -9,7 +9,6 @@ type Rgb = [u8; 3];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shades {
-    foreground: Rgb,
     text: Rgb,
     muted: Rgb,
     separator: Rgb,
@@ -19,9 +18,16 @@ struct Shades {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Accents {
+    yellow: Rgb,
+    cyan: Rgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
     colors_enabled: bool,
     shades: Option<Shades>,
+    accents: Option<Accents>,
 }
 
 impl Theme {
@@ -29,6 +35,7 @@ impl Theme {
         Self {
             colors_enabled,
             shades: None,
+            accents: None,
         }
     }
 
@@ -44,21 +51,37 @@ impl Theme {
         if self.colors_enabled {
             let fg = colors.foreground;
             let bg = colors.background;
-            if contrast(fg, bg) < 4.5 {
-                return self;
-            }
-            let selected = surface(fg, bg, 7);
-            let excerpt = surface(fg, bg, 4);
-            let selected_excerpt = surface(fg, bg, 10);
+            let readable = contrast(fg, bg) >= 4.5;
+            let reference = if readable {
+                fg
+            } else if contrast([0; 3], bg) >= contrast([255; 3], bg) {
+                [0; 3]
+            } else {
+                [255; 3]
+            };
+            let selected = if readable { surface(fg, bg, 7) } else { bg };
+            let excerpt = if readable { surface(fg, bg, 4) } else { bg };
+            let selected_excerpt = if readable { surface(fg, bg, 10) } else { bg };
             let backgrounds = [bg, selected, excerpt, selected_excerpt];
-            self.shades = Some(Shades {
-                foreground: fg,
+            self.shades = readable.then(|| Shades {
                 text: readable_mix(fg, bg, 86, 5.0, &backgrounds),
                 muted: readable_mix(fg, bg, 62, 4.5, &backgrounds),
                 separator: mix(fg, bg, 35),
                 selected,
                 excerpt,
                 selected_excerpt,
+            });
+            self.accents = Some(Accents {
+                yellow: readable_accent(
+                    colors.yellow.unwrap_or_else(|| mix([245, 190, 60], fg, 60)),
+                    reference,
+                    &backgrounds,
+                ),
+                cyan: readable_accent(
+                    colors.cyan.unwrap_or_else(|| mix([55, 180, 200], fg, 60)),
+                    reference,
+                    &backgrounds,
+                ),
             });
         }
         self
@@ -79,7 +102,7 @@ impl Theme {
     }
 
     pub fn accent(self) -> Style {
-        self.color(Color::Cyan)
+        self.color(self.accents.map_or(Color::Cyan, |s| rgb(s.cyan)))
     }
 
     pub fn separator(self) -> Style {
@@ -88,7 +111,7 @@ impl Theme {
     }
 
     pub fn workspace(self) -> Style {
-        self.normal().add_modifier(Modifier::BOLD)
+        self.accent().add_modifier(Modifier::BOLD)
     }
 
     pub fn tab(self) -> Style {
@@ -109,8 +132,7 @@ impl Theme {
     }
 
     pub fn highlight(self) -> Style {
-        self.normal()
-            .fg(self.shades.map_or(Color::Reset, |s| rgb(s.foreground)))
+        self.color(self.accents.map_or(Color::Yellow, |s| rgb(s.yellow)))
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     }
 
@@ -199,6 +221,17 @@ fn readable_mix(fg: Rgb, bg: Rgb, start: u16, minimum: f64, backgrounds: &[Rgb])
         .unwrap_or(fg)
 }
 
+fn readable_accent(accent: Rgb, foreground: Rgb, backgrounds: &[Rgb]) -> Rgb {
+    (0..=100)
+        .map(|amount| mix(foreground, accent, amount))
+        .find(|color| {
+            backgrounds
+                .iter()
+                .all(|background| contrast(*color, *background) >= 4.5)
+        })
+        .unwrap_or(foreground)
+}
+
 fn colors_allowed(no_color: Option<&OsStr>) -> bool {
     no_color.is_none_or(OsStr::is_empty)
 }
@@ -231,6 +264,9 @@ mod tests {
                 .contains(Modifier::BOLD | Modifier::UNDERLINED)
         );
         assert_eq!(theme.selected().bg, Some(Color::Reset));
+        assert_eq!(theme.highlight().fg, Some(Color::Yellow));
+        assert_eq!(theme.workspace().fg, Some(Color::Cyan));
+        assert_eq!(theme.tab().fg, theme.muted().fg);
     }
 
     #[test]
@@ -244,6 +280,8 @@ mod tests {
             let theme = Theme::new(true).with_terminal_colors(TerminalColors {
                 foreground,
                 background,
+                yellow: None,
+                cyan: None,
             });
             let s = theme.shades.unwrap();
             assert_eq!(theme.normal().bg, Some(Color::Reset));
@@ -266,8 +304,82 @@ mod tests {
         let theme = Theme::new(true).with_terminal_colors(TerminalColors {
             foreground: fg,
             background: bg,
+            yellow: None,
+            cyan: None,
         });
-        assert_eq!(theme, Theme::new(true));
+        assert_eq!(theme.normal(), Theme::new(true).normal());
+        assert_eq!(theme.selected(), Theme::new(true).selected());
+        let accents = theme.accents.unwrap();
+        assert!(contrast(accents.yellow, bg) >= 4.5);
+        assert!(contrast(accents.cyan, bg) >= 4.5);
+    }
+
+    #[test]
+    fn queried_palette_accents_are_kept_when_readable_and_never_color_the_background() {
+        let colors = TerminalColors {
+            foreground: [230; 3],
+            background: [18; 3],
+            yellow: Some([230, 190, 80]),
+            cyan: Some([70, 190, 205]),
+        };
+        let theme = Theme::new(true).with_terminal_colors(colors);
+        assert_eq!(theme.highlight().fg, Some(rgb(colors.yellow.unwrap())));
+        assert_eq!(theme.workspace().fg, Some(rgb(colors.cyan.unwrap())));
+        for style in [
+            theme.highlight(),
+            theme.workspace(),
+            theme.accent(),
+            theme.normal(),
+        ] {
+            assert_eq!(style.bg, Some(Color::Reset));
+        }
+        assert!(theme.workspace().add_modifier.contains(Modifier::BOLD));
+        assert!(
+            theme
+                .highlight()
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn optional_accents_remain_readable_on_light_dark_and_selected_surfaces() {
+        for (foreground, background) in [
+            ([240; 3], [16; 3]),
+            ([20; 3], [250; 3]),
+            ([171, 178, 191], [40, 44, 52]),
+            ([40, 48, 64], [250, 246, 230]),
+        ] {
+            let neutral = Theme::new(true).with_terminal_colors(TerminalColors {
+                foreground,
+                background,
+                yellow: None,
+                cyan: None,
+            });
+            for (yellow, cyan) in [
+                (None, None),
+                (Some(background), Some(background)),
+                (Some([255, 235, 80]), Some([70, 215, 235])),
+            ] {
+                let theme = Theme::new(true).with_terminal_colors(TerminalColors {
+                    foreground,
+                    background,
+                    yellow,
+                    cyan,
+                });
+                let shades = theme.shades.unwrap();
+                let accents = theme.accents.unwrap();
+                for accent in [accents.yellow, accents.cyan] {
+                    assert!(contrast(accent, background) >= 4.5);
+                    assert!(contrast(accent, shades.selected) >= 4.5);
+                }
+                assert_eq!(theme.selected().bg, neutral.selected().bg);
+                assert_eq!(theme.normal().bg, Some(Color::Reset));
+                assert_eq!(theme.highlight().bg, Some(Color::Reset));
+            }
+            assert_ne!(neutral.highlight().fg, neutral.normal().fg);
+            assert_ne!(neutral.workspace().fg, neutral.normal().fg);
+        }
     }
 
     #[test]
@@ -275,14 +387,20 @@ mod tests {
         let theme = Theme::new(false).with_terminal_colors(TerminalColors {
             foreground: [255; 3],
             background: [0; 3],
+            yellow: Some([255, 220, 40]),
+            cyan: Some([40, 220, 255]),
         });
         assert!(!theme.colors_enabled());
         assert!(theme.shades.is_none());
+        assert!(theme.accents.is_none());
         for style in [
             theme.normal(),
             theme.muted(),
             theme.selected(),
             theme.highlight(),
+            theme.workspace(),
+            theme.accent(),
+            theme.tab(),
             theme.excerpt(true),
             theme.status("working"),
         ]

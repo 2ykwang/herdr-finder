@@ -1570,6 +1570,36 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_title_matches_keep_their_color_on_the_selected_row() {
+        let mut app = app();
+        app.theme = Theme::new(true);
+        app.editor.insert("pymnt");
+        app.query_changed();
+        paint(&mut app, 120, 32);
+        let line = app
+            .lines
+            .iter()
+            .find(|line| line.key.as_deref() == Some("s:one"))
+            .unwrap();
+        let highlighted: String = line
+            .text
+            .spans
+            .iter()
+            .filter(|span| {
+                span.style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
+            })
+            .map(|span| {
+                assert_eq!(span.style.fg, app.theme.highlight().fg);
+                span.content.as_ref()
+            })
+            .collect();
+        assert_eq!(highlighted, "pymnt");
+        assert_ne!(app.theme.highlight().fg, app.theme.normal().fg);
+    }
+
+    #[test]
     fn enter_finishes_search_without_opening_and_a_second_press_opens_the_selection() {
         let mut app = app();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);

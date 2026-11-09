@@ -8,17 +8,22 @@ use std::{
 pub struct TerminalColors {
     pub foreground: [u8; 3],
     pub background: [u8; 3],
+    pub yellow: Option<[u8; 3]>,
+    pub cyan: Option<[u8; 3]>,
 }
 
 /// Crossterm 0.29 decodes OSC introducers and terminators as Alt-key events.
-/// Keep one input reader and consume complete OSC 10/11 frames, including
+/// Keep one input reader and consume complete OSC 4/10/11 frames, including
 /// unsupported color formats, so protocol bytes never become search text.
 pub struct ColorProbe {
     enabled: bool,
     pending: Vec<Event>,
+    oversized: bool,
     since: Instant,
     foreground: Option<[u8; 3]>,
     background: Option<[u8; 3]>,
+    yellow: Option<[u8; 3]>,
+    cyan: Option<[u8; 3]>,
 }
 
 impl ColorProbe {
@@ -26,16 +31,19 @@ impl ColorProbe {
         Self {
             enabled,
             pending: Vec::new(),
+            oversized: false,
             since: Instant::now(),
             foreground: None,
             background: None,
+            yellow: None,
+            cyan: None,
         }
     }
 
     pub fn request(&mut self, output: &mut impl Write) {
         if self.enabled
             && output
-                .write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")
+                .write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;3;?\x1b\\\x1b]4;6;?\x1b\\")
                 .and_then(|()| output.flush())
                 .is_err()
         {
@@ -51,7 +59,13 @@ impl ColorProbe {
             Duration::from_millis(150)
         };
         if !self.pending.is_empty() && now.duration_since(self.since) >= limit {
-            std::mem::take(&mut self.pending)
+            // An interrupted color reply must not replay its Escape as a close command.
+            let protocol = decoded_reply(&self.pending)
+                .0
+                .is_some_and(|payload| reply_payload(&payload));
+            self.oversized = false;
+            let pending = std::mem::take(&mut self.pending);
+            if protocol { Vec::new() } else { pending }
         } else {
             Vec::new()
         }
@@ -76,11 +90,14 @@ impl ColorProbe {
         let (payload, complete) = decoded_reply(&self.pending);
         if let Some(payload) = payload {
             if complete {
-                if let Some((kind, color)) = parse_color(&payload) {
-                    if kind == 10 {
-                        self.foreground = Some(color);
-                    } else {
-                        self.background = Some(color);
+                if !self.oversized
+                    && let Some((kind, color)) = parse_color(&payload)
+                {
+                    match kind {
+                        ColorTarget::Foreground => self.foreground = Some(color),
+                        ColorTarget::Background => self.background = Some(color),
+                        ColorTarget::Yellow => self.yellow = Some(color),
+                        ColorTarget::Cyan => self.cyan = Some(color),
                     }
                     self.pending.clear();
                     return (
@@ -90,19 +107,40 @@ impl ColorProbe {
                             .map(|(foreground, background)| TerminalColors {
                                 foreground,
                                 background,
+                                yellow: self.yellow,
+                                cyan: self.cyan,
                             }),
                     );
                 }
-                if payload.starts_with("10;") || payload.starts_with("11;") {
+                if reply_payload(&payload) {
                     self.pending.clear();
+                    self.oversized = false;
                     return (ready, None);
                 }
-            } else if valid_prefix(&payload) && self.pending.len() < 48 {
+            } else if valid_prefix(&payload) {
+                if self.pending.len() >= 48 {
+                    // Keep the header and a split terminator while bounding malformed frames.
+                    self.oversized = true;
+                    let escape = self
+                        .pending
+                        .last()
+                        .is_some_and(|event| is_key(event, KeyCode::Esc, KeyModifiers::NONE));
+                    let start = if is_key(&self.pending[0], KeyCode::Esc, KeyModifiers::NONE) {
+                        2
+                    } else {
+                        1
+                    };
+                    self.pending.truncate(start + 3);
+                    if escape {
+                        self.pending.push(Event::Key(KeyCode::Esc.into()));
+                    }
+                }
                 return (ready, None);
             }
         }
         let last = self.pending.pop().expect("the current event is buffered");
         ready.append(&mut self.pending);
+        self.oversized = false;
         if self.starts_reply(&last) {
             self.since = now;
             self.pending.push(last);
@@ -113,9 +151,9 @@ impl ColorProbe {
     }
 
     fn starts_reply(&self, event: &Event) -> bool {
+        // Optional palette replies can arrive after default colors with a split introducer.
         is_key(event, KeyCode::Char(']'), KeyModifiers::ALT)
-            || ((self.foreground.is_none() || self.background.is_none())
-                && is_key(event, KeyCode::Esc, KeyModifiers::NONE))
+            || is_key(event, KeyCode::Esc, KeyModifiers::NONE)
     }
 }
 
@@ -156,9 +194,7 @@ fn decoded_reply(events: &[Event]) -> (Option<String>, bool) {
                 modifiers,
                 kind: KeyEventKind::Press,
                 ..
-            }) if ch.is_ascii()
-                && (*modifiers == KeyModifiers::NONE || *modifiers == KeyModifiers::SHIFT) =>
-            {
+            }) if *modifiers == KeyModifiers::NONE || *modifiers == KeyModifiers::SHIFT => {
                 payload.push(*ch)
             }
             _ => return (None, false),
@@ -168,16 +204,31 @@ fn decoded_reply(events: &[Event]) -> (Option<String>, bool) {
 }
 
 fn valid_prefix(payload: &str) -> bool {
-    ["10;", "11;"]
+    ["4;", "10;", "11;"]
         .iter()
         .any(|header| header.starts_with(payload) || payload.starts_with(header))
 }
 
-fn parse_color(payload: &str) -> Option<(u8, [u8; 3])> {
+fn reply_payload(payload: &str) -> bool {
+    ["4;", "10;", "11;"]
+        .iter()
+        .any(|header| payload.starts_with(header))
+}
+
+enum ColorTarget {
+    Foreground,
+    Background,
+    Yellow,
+    Cyan,
+}
+
+fn parse_color(payload: &str) -> Option<(ColorTarget, [u8; 3])> {
     let (kind, rgb) = payload.split_once(";rgb:")?;
     let kind = match kind {
-        "10" => 10,
-        "11" => 11,
+        "10" => ColorTarget::Foreground,
+        "11" => ColorTarget::Background,
+        "4;3" => ColorTarget::Yellow,
+        "4;6" => ColorTarget::Cyan,
         _ => return None,
     };
     let parts: Vec<_> = rgb.split('/').collect();
@@ -231,6 +282,127 @@ mod tests {
         events
     }
 
+    fn consume_reply(
+        probe: &mut ColorProbe,
+        payload: &str,
+        split: bool,
+        now: Instant,
+    ) -> Option<TerminalColors> {
+        let mut palette = None;
+        for event in reply(payload, split) {
+            let (ready, colors) = probe.feed(event, now);
+            assert!(ready.is_empty(), "protocol input escaped: {payload}");
+            palette = colors.or(palette);
+        }
+        palette
+    }
+
+    #[test]
+    fn palette_and_default_colors_work_in_every_reply_order() {
+        let replies = [
+            "10;rgb:eeee/eeee/eeee",
+            "11;rgb:1111/1111/1111",
+            "4;3;rgb:dddd/aaaa/4444",
+            "4;6;rgb:4444/bbbb/cccc",
+        ];
+        for split in [false, true] {
+            for first in 0..4 {
+                for second in 0..4 {
+                    if second == first {
+                        continue;
+                    }
+                    for third in 0..4 {
+                        if third == first || third == second {
+                            continue;
+                        }
+                        let fourth = (0..4)
+                            .find(|index| ![first, second, third].contains(index))
+                            .unwrap();
+                        let mut probe = ColorProbe::new(true);
+                        let mut palette = None;
+                        for index in [first, second, third, fourth] {
+                            palette =
+                                consume_reply(&mut probe, replies[index], split, Instant::now())
+                                    .or(palette);
+                        }
+                        assert_eq!(
+                            palette,
+                            Some(TerminalColors {
+                                foreground: [238; 3],
+                                background: [17; 3],
+                                yellow: Some([221, 170, 68]),
+                                cyan: Some([68, 187, 204]),
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_optional_colors_update_the_palette_without_leaking_escape() {
+        let mut probe = ColorProbe::new(true);
+        let now = Instant::now();
+        assert!(consume_reply(&mut probe, "10;rgb:ff/ff/ff", false, now).is_none());
+        let initial = consume_reply(&mut probe, "11;rgb:00/00/00", false, now).unwrap();
+        assert!(initial.yellow.is_none() && initial.cyan.is_none());
+        let later = now + Duration::from_secs(5);
+        let yellow = consume_reply(&mut probe, "4;3;rgb:dd/aa/44", true, later).unwrap();
+        assert_eq!(yellow.yellow, Some([221, 170, 68]));
+        assert!(yellow.cyan.is_none());
+        let cyan = consume_reply(&mut probe, "4;6;rgb:44/bb/cc", true, later).unwrap();
+        assert_eq!(cyan.yellow, yellow.yellow);
+        assert_eq!(cyan.cyan, Some([68, 187, 204]));
+        let typed = Event::Key(KeyCode::Char('x').into());
+        assert_eq!(probe.feed(typed.clone(), later).0, vec![typed]);
+    }
+
+    #[test]
+    fn malformed_and_oversized_palette_frames_are_consumed_without_keys() {
+        for split in [false, true] {
+            let mut probe = ColorProbe::new(true);
+            for payload in [
+                "4;3;unknown",
+                "4;6;rgb:zz/00/00",
+                "4;3;rgb:ff/00",
+                "4;6;rgb:fffff/0/0",
+                "4;255;rgb:ff/00/00",
+                "4;6;색상",
+            ] {
+                assert!(consume_reply(&mut probe, payload, split, Instant::now()).is_none());
+            }
+            assert!(
+                consume_reply(
+                    &mut probe,
+                    &format!("4;3;{}", "x".repeat(400)),
+                    split,
+                    Instant::now()
+                )
+                .is_none()
+            );
+            let paste = Event::Paste("ordinary query".into());
+            assert_eq!(probe.feed(paste.clone(), Instant::now()).0, vec![paste]);
+        }
+    }
+
+    #[test]
+    fn unterminated_protocol_prefix_times_out_without_becoming_search_input() {
+        let mut probe = ColorProbe::new(true);
+        let now = Instant::now();
+        let mut events = reply("4;6;rgb:00", false);
+        events.pop();
+        for event in events {
+            assert!(probe.feed(event, now).0.is_empty());
+        }
+        assert!(probe.expire(now + Duration::from_millis(151)).is_empty());
+        let key = Event::Key(KeyCode::Char('q').into());
+        assert_eq!(
+            probe.feed(key.clone(), now + Duration::from_millis(152)).0,
+            vec![key]
+        );
+    }
+
     #[test]
     fn split_color_replies_and_surrounding_input_preserve_keys_and_paste() {
         for split in [true, false] {
@@ -259,7 +431,9 @@ mod tests {
                 palette,
                 Some(TerminalColors {
                     foreground: [170, 187, 204],
-                    background: [18, 52, 86]
+                    background: [18, 52, 86],
+                    yellow: None,
+                    cyan: None,
                 })
             );
         }
@@ -304,7 +478,10 @@ mod tests {
         }
         let mut probe = ColorProbe::new(true);
         probe.request(&mut output);
-        assert_eq!(output, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        assert_eq!(
+            output,
+            b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;3;?\x1b\\\x1b]4;6;?\x1b\\"
+        );
         let later = Instant::now() + Duration::from_secs(5);
         for event in reply("11;rgb:0/0/0", false) {
             assert!(probe.feed(event, later).0.is_empty());
@@ -322,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn an_alt_key_before_a_reply_is_preserved_and_escape_is_immediate_after_both_replies() {
+    fn an_alt_key_before_a_reply_and_escape_after_colors_are_preserved() {
         let mut probe = ColorProbe::new(true);
         let alt = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
         let mut ready = probe.feed(alt.clone(), Instant::now()).0;
@@ -333,6 +510,8 @@ mod tests {
         }
         assert_eq!(ready, vec![alt]);
         let escape = Event::Key(KeyCode::Esc.into());
-        assert_eq!(probe.feed(escape.clone(), Instant::now()).0, vec![escape]);
+        let now = Instant::now();
+        assert!(probe.feed(escape.clone(), now).0.is_empty());
+        assert_eq!(probe.expire(now + Duration::from_millis(12)), vec![escape]);
     }
 }
