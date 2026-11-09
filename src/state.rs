@@ -191,9 +191,18 @@ pub struct FinderState {
     sessions: HashMap<String, Session>,
     tabs: HashMap<String, Vec<TabNode>>,
     contents: HashMap<String, CachedContent>,
+    workspace_visits: HashMap<String, i64>,
+    browse_order: Vec<String>,
 }
 
 impl FinderState {
+    /// Seed visit times before the first snapshot. Browse order stays fixed until closing.
+    pub fn set_workspace_visits(&mut self, visits: HashMap<String, i64>) {
+        if self.snapshot.is_none() {
+            self.workspace_visits = visits;
+        }
+    }
+
     pub fn rows(&self) -> &[Row] {
         &self.rows
     }
@@ -445,6 +454,14 @@ impl FinderState {
         }
         if querying {
             workspaces.sort_by_key(|rows| std::cmp::Reverse(rows[0].score));
+        } else {
+            let positions: HashMap<_, _> = self
+                .browse_order
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (id.as_str(), index))
+                .collect();
+            workspaces.sort_by_key(|rows| positions[rows[0].workspace.id.as_str()]);
         }
         let mut rows = Vec::new();
         for (index, mut workspace) in workspaces.into_iter().enumerate() {
@@ -505,6 +522,36 @@ impl FinderState {
             return;
         }
         let initial = self.snapshot.is_none();
+        if initial {
+            let current = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.focused);
+            let mut workspaces: Vec<_> = snapshot.workspaces.iter().collect();
+            workspaces.sort_by_key(|workspace| {
+                (
+                    !current.is_some_and(|current| current.id == workspace.id),
+                    std::cmp::Reverse(self.workspace_visits.get(&workspace.id).copied()),
+                )
+            });
+            self.browse_order = workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect();
+            self.workspace_visits.clear();
+        } else {
+            self.browse_order.retain(|id| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| &workspace.id == id)
+            });
+            for workspace in &snapshot.workspaces {
+                if !self.browse_order.contains(&workspace.id) {
+                    self.browse_order.push(workspace.id.clone());
+                }
+            }
+        }
         self.index_snapshot(&snapshot);
         let focused = snapshot
             .sessions

@@ -32,6 +32,7 @@ use crate::{
     model::{FinderError, Session, Snapshot},
     search::{ContentDocument, highlight_spans_terms},
     state::{FinderState, GroupLevel, RowKind},
+    visits::{VisitHistory, visit_time},
 };
 use input::Editor;
 use messages::Messages;
@@ -40,7 +41,7 @@ use terminal_colors::ColorProbe;
 use theme::Theme;
 
 enum Update {
-    Snapshot(Result<Snapshot, FinderError>),
+    Snapshot(Result<Snapshot, FinderError>, Option<HashMap<String, i64>>),
     Contents(Vec<Session>, HashMap<String, ContentDocument>),
     Focus(Result<(), FinderError>),
     Preview(Box<PreviewResponse>),
@@ -200,10 +201,31 @@ impl App {
             return;
         }
         let client = self.client.clone();
+        let history = self
+            .state
+            .snapshot
+            .is_none()
+            .then(|| VisitHistory::from_env(client.socket_path()))
+            .flatten();
         self.snapshot_busy = true;
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let _ = sender.send(Update::Snapshot(client.snapshot()));
+            let at = visit_time();
+            let snapshot = client.snapshot();
+            let visits = history
+                .zip(snapshot.as_ref().ok())
+                .map(|(history, snapshot)| {
+                    let visits = history.recent().unwrap_or_default();
+                    if let Some(workspace) = snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.focused)
+                    {
+                        let _ = history.record(&workspace.id, at);
+                    }
+                    visits
+                });
+            let _ = sender.send(Update::Snapshot(snapshot, visits));
         });
     }
 
@@ -228,11 +250,14 @@ impl App {
 
     fn receive(&mut self, update: Update) {
         match update {
-            Update::Snapshot(result) => {
+            Update::Snapshot(result, visits) => {
                 self.snapshot_busy = false;
                 match result {
                     Ok(snapshot) => {
                         let initial = self.state.snapshot.is_none();
+                        if let Some(visits) = visits {
+                            self.state.set_workspace_visits(visits);
+                        }
                         self.indexed
                             .retain(|id, _| snapshot.sessions.iter().any(|s| &s.terminal_id == id));
                         self.state.update(snapshot);
@@ -2577,11 +2602,11 @@ mod tests {
         paint(&mut app, 80, 24);
         app.scroll = 30;
         app.reveal = false;
-        app.receive(Update::Snapshot(Ok(snapshot.clone())));
+        app.receive(Update::Snapshot(Ok(snapshot.clone()), None));
         paint(&mut app, 80, 24);
         assert_eq!(app.scroll, 30);
         snapshot.sessions.remove(0);
-        app.receive(Update::Snapshot(Ok(snapshot)));
+        app.receive(Update::Snapshot(Ok(snapshot), None));
         assert!(app.state.selected().is_none());
         app.activate();
         assert!(!app.opening);
@@ -2652,7 +2677,7 @@ mod tests {
         paint(&mut app, 80, 24);
         let following = app.lines[app.scroll + 1].key.clone();
         snapshot.sessions[0].activity_at = Some(Utc::now());
-        app.receive(Update::Snapshot(Ok(snapshot)));
+        app.receive(Update::Snapshot(Ok(snapshot), None));
         paint(&mut app, 80, 24);
         assert!(app.lines[app.scroll].key.is_none());
         assert_eq!(app.lines[app.scroll + 1].key, following);

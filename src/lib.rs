@@ -8,3 +8,4 @@ pub mod query;
 pub mod search;
 pub mod state;
 pub mod ui;
+pub mod visits;

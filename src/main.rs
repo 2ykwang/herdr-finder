@@ -1,4 +1,8 @@
-use herdr_finder::{client::Client, ui};
+use herdr_finder::{
+    client::Client,
+    ui,
+    visits::{VisitHistory, visit_time},
+};
 use std::{env, error::Error, process::ExitCode};
 
 const OPEN_ACTION: &str = "herdr-finder.open";
@@ -16,10 +20,11 @@ fn shortcut() -> String {
 fn print_help() {
     println!(
         "{} {}\n\
-         Usage: {} [run|open|shortcut|--version|--help]\n\n\
+         Usage: {} [run|open|shortcut|record-visit|--version|--help]\n\n\
          run opens the finder UI in the current Herdr popup.\n\
          open invokes the installed plugin pane through Herdr.\n\
          shortcut prints a plugin-action key binding.\n\
+         record-visit stores workspace focus events from Herdr.\n\n\
          Install and update this plugin with Herdr's plugin manager.",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
@@ -44,6 +49,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         "shortcut" => println!("{}", shortcut()),
         "open" => Client::from_env()?.open_popup()?,
         "run" => ui::run(Client::from_env()?.excluding_caller())?,
+        "record-visit" => {
+            let at = visit_time();
+            let client = Client::from_env()?;
+            let history = VisitHistory::from_env(client.socket_path())
+                .ok_or("HERDR_PLUGIN_STATE_DIR is required")?;
+            let event: serde_json::Value =
+                serde_json::from_str(&env::var("HERDR_PLUGIN_EVENT_JSON")?)?;
+            history.event(&event, at)?;
+        }
         other => return Err(format!("Unknown command: {other}").into()),
     }
     Ok(())
